@@ -10,13 +10,16 @@ const log = pino({ transport: { target: 'pino-pretty' }});
 try { fs.mkdirSync(cfg.dataDir, { recursive: true }); } catch {}
 
 const CACHE_PATH = path.join(cfg.dataDir, cfg.topWalletsCacheFile);
-const ACTIVE_WINDOW_MS = cfg.activeWithinHours * 60 * 60 * 1000;
+const ACTIVE_WINDOW_MS = (cfg.activeWithinHours || 24) * 60 * 60 * 1000;
+const PNL_TIMEOUT = 12000;
+const TRADES_TIMEOUT = 10000;
+const ENRICH_CONCURRENCY = 5;
 
 /**
  * Fetch TOP PAGE ONLY from SolanaTracker sorted by winPercentage.
- * We normalize to { address, winRatePercent } and return raw list.
+ * Normalize to { address, winRatePercent } and return raw list.
  *
- * Docs: GET /top-traders/all?sortBy=winPercentage
+ * Endpoint: GET /top-traders/all?sortBy=winPercentage&expandPnl=false
  */
 async function fetchTopTradersTopPageST() {
   if (!cfg.stApiKey) throw new Error('ST_API_KEY missing – set your SolanaTracker API key.');
@@ -27,7 +30,7 @@ async function fetchTopTradersTopPageST() {
 
   const res = await fetch(url.toString(), {
     headers: { 'x-api-key': cfg.stApiKey },
-    timeout: 15_000
+    timeout: 15000
   });
 
   if (!res.ok) {
@@ -48,29 +51,97 @@ async function fetchTopTradersTopPageST() {
 }
 
 /**
- * For a given wallet, fetch recent trades and return the most recent trade time (ms).
+ * PnL endpoint with 1d historic:
+ *   GET /wallet/{owner}/pnl?showHistoricPnL=true&hideDetails=true
+ * We infer "active in last 24h" if the 1d bucket shows non-zero *invested* or *trades/tx count*,
+ * or any signal that something changed in last day.
+ * Because schema varies, we defensively look for common shapes:
+ *   j.historic?.['1d'] / j.summary?.historic?.['1d'] / j.summary?.oneDay / j.historicPnL?.['1d']
+ * and check fields like totalInvested, invested, trades, txCount, realized/unrealized/total deltas.
  *
- * Docs: GET /wallet/{owner}/trades  -> returns { trades: [{ time: 1722759119596, ... }], ... }
+ * Returns: { activeWithin1d: boolean } and optionally a synthetic lastActiveMsAgo = 0 if active; else null.
  */
-async function getLastTradeTimeMs(owner) {
+async function getPnL1dActivity(owner) {
+  try {
+    const u = new URL(`${cfg.stBaseUrl}/wallet/${owner}/pnl`);
+    u.searchParams.set('showHistoricPnL', 'true');
+    u.searchParams.set('hideDetails', 'true');
+
+    const res = await fetch(u.toString(), {
+      headers: { 'x-api-key': cfg.stApiKey },
+      timeout: PNL_TIMEOUT
+    });
+    if (!res.ok) return { activeWithin1d: false, lastActiveMsAgo: null };
+
+    const j = await res.json();
+
+    // Try to locate a 1d bucket
+    const buckets = [
+      j?.historic,
+      j?.historicPnL,
+      j?.summary?.historic,
+      j?.summary?.history,
+      j?.summary?.oneDay ? { '1d': j?.summary?.oneDay } : null
+    ].filter(Boolean);
+
+    let oneDay = null;
+    for (const b of buckets) {
+      // keys might be '1d' or 'oneDay'
+      if (b['1d']) { oneDay = b['1d']; break; }
+      if (b.oneDay) { oneDay = b.oneDay; break; }
+      if (b['24h']) { oneDay = b['24h']; break; }
+    }
+
+    if (!oneDay || typeof oneDay !== 'object') {
+      return { activeWithin1d: false, lastActiveMsAgo: null };
+    }
+
+    // Probe common fields that indicate activity: invested/totalInvested, trades, txCount, realized/unrealized/total
+    const maybeNums = [
+      oneDay.invested, oneDay.totalInvested, oneDay.buyAmount, oneDay.sold, oneDay.realized,
+      oneDay.unrealized, oneDay.total, oneDay.volume, oneDay.pnl, oneDay.netPnL
+    ].map(x => Number(x)).filter(x => Number.isFinite(x));
+
+    const counts = [
+      oneDay.trades, oneDay.txCount, oneDay.buys, oneDay.sells, oneDay.positions
+    ].map(x => Number(x)).filter(x => Number.isFinite(x));
+
+    const hasValue = maybeNums.some(v => Math.abs(v) > 0);
+    const hasCount = counts.some(c => c > 0);
+
+    const activeWithin1d = Boolean(hasValue || hasCount);
+    // PnL 1d doesn't give an exact timestamp — if "active", treat as 0 ms ago (we'll display "0–24h")
+    return { activeWithin1d, lastActiveMsAgo: activeWithin1d ? 0 : null };
+  } catch {
+    return { activeWithin1d: false, lastActiveMsAgo: null };
+  }
+}
+
+/**
+ * Fallback last trade time via trades endpoint:
+ *   GET /wallet/{owner}/trades  -> trades: [{ time: 1722759119596 }, ...]
+ * Returns msAgo or null.
+ */
+async function getLastTradeMsAgo(owner) {
   try {
     const url = `${cfg.stBaseUrl}/wallet/${owner}/trades`;
     const res = await fetch(url, {
       headers: { 'x-api-key': cfg.stApiKey },
-      timeout: 12_000
+      timeout: TRADES_TIMEOUT
     });
     if (!res.ok) return null;
     const j = await res.json();
     const trades = Array.isArray(j?.trades) ? j.trades : [];
     if (!trades.length) return null;
 
-    // Trades are typically returned newest-first; take max just in case
     let latest = 0;
     for (const t of trades) {
       const ms = Number(t?.time);
       if (Number.isFinite(ms) && ms > latest) latest = ms;
     }
-    return latest || null;
+    if (!latest) return null;
+    const msAgo = Date.now() - latest;
+    return msAgo >= 0 ? msAgo : 0;
   } catch {
     return null;
   }
@@ -100,40 +171,44 @@ function writeCache(items) {
 }
 
 /**
- * Take the first cfg.topWallets from the raw top page,
- * enrich with lastTradeTime (ms), then:
- *   - keep only wallets with lastTradeTime within ACTIVE_WINDOW_MS
- *   - filter by winPercentage >= cfg.minWinRatePercent
- *   - sort by win% desc
- *   - take cfg.trackTopN
+ * Enrich each wallet with lastActiveMsAgo using:
+ *   1) PnL 1d (activity yes/no) => if active, msAgo=0
+ *   2) else, trades.latest => msAgo from timestamp
+ * Then filter by:
+ *   - activeWithinHours (msAgo <= ACTIVE_WINDOW_MS OR msAgo === 0 from 1d PnL)
+ *   - winRatePercent >= threshold
+ * Sort by win% desc, limit to trackTopN.
  *
- * Returns [{ address, winRatePercent, lastTradeTime }]
+ * Returns [{ address, winRatePercent, lastActiveMsAgo }]
  */
 async function filterPickActive(topPageRaw) {
   const slice = topPageRaw.slice(0, cfg.topWallets);
 
-  // Enrich with last trade time (bounded concurrency: 5 at a time)
   const enriched = [];
-  const concurrency = 5;
-  for (let i = 0; i < slice.length; i += concurrency) {
-    const batch = slice.slice(i, i + concurrency);
+  for (let i = 0; i < slice.length; i += ENRICH_CONCURRENCY) {
+    const batch = slice.slice(i, i + ENRICH_CONCURRENCY);
     // eslint-disable-next-line no-await-in-loop
     const results = await Promise.all(
       batch.map(async (w) => {
-        const lastTradeTime = await getLastTradeTimeMs(w.address);
-        return { ...w, lastTradeTime };
+        // First try PnL 1d
+        const pnl = await getPnL1dActivity(w.address);
+        if (pnl.activeWithin1d) {
+          return { ...w, lastActiveMsAgo: 0 };
+        }
+        // Fallback to trades timestamp
+        const msAgo = await getLastTradeMsAgo(w.address);
+        return { ...w, lastActiveMsAgo: Number.isFinite(msAgo) ? msAgo : null };
       })
     );
     enriched.push(...results);
   }
 
-  const now = Date.now();
   const active = enriched
-    .filter(w => Number.isFinite(w.winRatePercent))
-    .filter(w => w.winRatePercent >= cfg.minWinRatePercent)
+    .filter(w => Number.isFinite(w.winRatePercent) && w.winRatePercent >= cfg.minWinRatePercent)
     .filter(w => {
-      if (!w.lastTradeTime) return false;
-      return (now - w.lastTradeTime) <= ACTIVE_WINDOW_MS;
+      if (w.lastActiveMsAgo === 0) return true; // active within 1d by PnL
+      if (w.lastActiveMsAgo == null) return false;
+      return w.lastActiveMsAgo <= ACTIVE_WINDOW_MS;
     })
     .sort((a, b) => b.winRatePercent - a.winRatePercent)
     .slice(0, cfg.trackTopN);
@@ -154,16 +229,14 @@ async function filterPickActive(topPageRaw) {
  *  - Else fetch once and cache raw result,
  *  - Then filter for activity + win% and return objects.
  *
- * Returns: [{ address, winRatePercent, lastTradeTime }]
+ * Returns: [{ address, winRatePercent, lastActiveMsAgo }]
  */
 export async function getTopWallets() {
-  // 1) Try cache
   const cached = readCache();
   if (cached?.length) {
     return filterPickActive(cached);
   }
 
-  // 2) Fetch from ST (top page only)
   let rawTop = [];
   try {
     rawTop = await fetchTopTradersTopPageST();
@@ -172,9 +245,6 @@ export async function getTopWallets() {
     return [];
   }
 
-  // 3) Cache raw result to avoid rinsing the API
   writeCache(rawTop);
-
-  // 4) Filter for activity + win%
   return await filterPickActive(rawTop);
 }

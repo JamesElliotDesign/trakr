@@ -1,4 +1,3 @@
-// src/telegram.js
 import fetch from 'node-fetch';
 import { cfg } from './config.js';
 
@@ -33,13 +32,21 @@ export async function sendSignal({ wallet, mint, amount, priceUsd, sourceTx, pro
   await sendMessage(text);
 }
 
+function fmtAgo(ms) {
+  if (ms === 0) return '0–24h'; // PnL 1d indicates activity in last day, no exact time
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h >= 1) return `${h}h${m ? ` ${m}m` : ''}`;
+  return `${m}m`;
+}
+
 export async function sendTrackingSummary(walletsWithWin) {
-  // walletsWithWin: [{ address, winRatePercent }]
-  const header = `🛰️ *Tracking ${walletsWithWin.length} wallets* (win% ≥ ${cfg.minWinRatePercent})`;
+  // walletsWithWin: [{ address, winRatePercent, lastActiveMsAgo }]
+  const header = `🛰️ *Tracking ${walletsWithWin.length} wallets* (win% ≥ ${cfg.minWinRatePercent}, active ≤ ${cfg.activeWithinHours}h)`;
   const lines = walletsWithWin.map((w, i) => {
     const pct = (Number(w.winRatePercent) || 0).toFixed(2);
-    return `${String(i + 1).padStart(2, ' ')}. \`${w.address}\` — *${pct}%*`;
-    // (you can add Solscan links later with inline buttons if you want)
+    const act = (w.lastActiveMsAgo == null) ? 'unknown' : fmtAgo(w.lastActiveMsAgo);
+    return `${String(i + 1).padStart(2, ' ')}. \`${w.address}\` — *${pct}%* _(active ${act} ago)_`;
   });
   const text = [header, ...lines].join('\n');
   await sendMessage(text);
