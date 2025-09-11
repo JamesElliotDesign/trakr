@@ -1,32 +1,64 @@
-import Redis from 'ioredis';
+import fs from 'fs';
+import path from 'path';
 
-const PREFIX = 'seen';
+const DATA_DIR = process.env.DATA_DIR || './data';
+const SEEN_PATH = path.join(DATA_DIR, 'seen.json');
+
+// ensure dir exists
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+
 let mem = new Map();
-let redis = null;
+let dirty = false;
+let writeTimer = null;
 
-if (process.env.REDIS_URL) {
-  redis = new Redis(process.env.REDIS_URL, {
-    // optional: tls, retryStrategy, etc.
-  });
+// debounce writes to avoid thrashing the FS
+function scheduleWrite() {
+  if (writeTimer) return;
+  writeTimer = setTimeout(() => {
+    writeTimer = null;
+    if (!dirty) return;
+    dirty = false;
+    try {
+      const obj = Object.fromEntries(mem.entries());
+      fs.writeFileSync(SEEN_PATH, JSON.stringify(obj), 'utf8');
+    } catch { /* ignore */ }
+  }, 750); // adjust if needed
 }
 
-/** Preload the seen cache from Redis (hash). Call once on boot. */
 export async function preloadSeen() {
-  if (!redis) return;
-  const all = await redis.hgetall(PREFIX); // { key1: "ts", key2: "ts", ... }
-  for (const [k, v] of Object.entries(all)) mem.set(k, Number(v));
+  try {
+    if (fs.existsSync(SEEN_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(SEEN_PATH, 'utf8'));
+      mem = new Map(Object.entries(raw).map(([k, v]) => [k, Number(v)]));
+    }
+  } catch { /* ignore */ }
 }
 
-/** Write-through helpers with in-memory hot path. */
 export const seenCache = {
   get: (k) => mem.get(k),
   has: (k) => mem.has(k),
   set: (k, v) => {
     mem.set(k, v);
-    if (redis) redis.hset(PREFIX, k, String(v)).catch(() => {});
+    dirty = true;
+    scheduleWrite();
   },
   delete: (k) => {
     mem.delete(k);
-    if (redis) redis.hdel(PREFIX, k).catch(() => {});
+    dirty = true;
+    scheduleWrite();
+  },
+  // helpful if you want to clear test state
+  clear: () => {
+    mem.clear();
+    dirty = true;
+    scheduleWrite();
   }
 };
+
+// expose a flush for graceful shutdowns
+export function flushSeenSync() {
+  try {
+    const obj = Object.fromEntries(mem.entries());
+    fs.writeFileSync(SEEN_PATH, JSON.stringify(obj), 'utf8');
+  } catch { /* ignore */ }
+}
