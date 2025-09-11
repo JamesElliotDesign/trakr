@@ -7,7 +7,7 @@ import { cfg } from './config.js';
 
 const log = pino({ transport: { target: 'pino-pretty' }});
 
-// Ensure data dir exists (persists for the life of the instance)
+// Ensure data dir exists (persists for life of instance)
 try { fs.mkdirSync(cfg.dataDir, { recursive: true }); } catch {}
 
 const CACHE_PATH = path.join(cfg.dataDir, cfg.topWalletsCacheFile);
@@ -15,21 +15,6 @@ const CACHE_PATH = path.join(cfg.dataDir, cfg.topWalletsCacheFile);
 /**
  * Fetch TOP PAGE ONLY from SolanaTracker sorted by winPercentage.
  * We do NOT filter at fetch time — we normalize, cache, and return raw.
- *
- * Endpoint:
- *   GET /top-traders/all
- *
- * Query params:
- *   sortBy=winPercentage
- *   expandPnl=false
- *
- * Response shape (example):
- * {
- *   "wallets": [
- *     { "wallet": "...", "summary": { "winPercentage": 33.05, "totalWins": 423, ... } },
- *     ...
- *   ]
- * }
  */
 async function fetchTopTradersTopPageST() {
   if (!cfg.stApiKey) throw new Error('ST_API_KEY missing – set your SolanaTracker API key.');
@@ -51,7 +36,7 @@ async function fetchTopTradersTopPageST() {
   const data = await res.json();
   const wallets = Array.isArray(data?.wallets) ? data.wallets : [];
 
-  // Normalize to local shape; ST winPercentage is 0–100 (e.g., 36.27)
+  // Normalize; ST winPercentage is 0–100 (e.g., 36.27)
   const normalized = wallets.map(w => ({
     address: w?.wallet,
     winRatePercent: Number(w?.summary?.winPercentage ?? 0)
@@ -88,7 +73,9 @@ function writeCache(items) {
  *  - Take first cfg.topWallets entries from raw top page,
  *  - Filter by winPercentage >= cfg.minWinRatePercent ONLY,
  *  - Sort by winPercentage desc,
- *  - Take cfg.trackTopN addresses.
+ *  - Take cfg.trackTopN.
+ *
+ * Returns array of { address, winRatePercent }.
  */
 function filterAndPick(topPageRaw) {
   const topSlice = topPageRaw.slice(0, cfg.topWallets);
@@ -99,22 +86,22 @@ function filterAndPick(topPageRaw) {
     .sort((a, b) => b.winRatePercent - a.winRatePercent)
     .slice(0, cfg.trackTopN);
 
-  const addresses = filtered.map(i => i.address);
-
   log.info({
     considered: topSlice.length,
-    selected: addresses.length,
+    selected: filtered.length,
     minWinRatePercent: cfg.minWinRatePercent
   }, 'SolanaTracker selection (filtered by winPercentage)');
 
-  return addresses;
+  return filtered;
 }
 
 /**
  * Public: getTopWallets
  *  - Use cache if fresh,
  *  - Else fetch once, cache raw result,
- *  - Then apply local filtering by winPercentage and return addresses.
+ *  - Then apply local filtering by winPercentage.
+ *
+ * Returns: [{ address, winRatePercent }, ...]
  */
 export async function getTopWallets() {
   // 1) Try cache
