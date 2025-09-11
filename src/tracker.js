@@ -1,39 +1,141 @@
+// src/tracker.js
+import fs from 'fs';
+import path from 'path';
 import fetch from 'node-fetch';
-import { cfg } from './config.js';
 import pino from 'pino';
+import { cfg } from './config.js';
 
 const log = pino({ transport: { target: 'pino-pretty' }});
 
-/**
- * Interface we expect from any source:
- * returns [{address, winRate, roi, pnl, trades, ...}, ...]
- */
-async function fetchFromSolanaTracker(top = 20) {
-  // TODO: Replace with SolanaTracker’s real API when available.
-  // If there’s no public API, you can maintain a curated list or build
-  // a tiny scraper behind Cloudflare (be mindful of ToS).
-  // For now, return a static/dummy structure to keep the pipeline working.
-  log.warn('SolanaTracker adapter is a stub. Replace with real fetch.');
-  return [
-    // { address: "wallet1...", winRate: 0.72, roi: 2.1, trades: 180 },
-    // ...
-  ].slice(0, top);
-}
+// Ensure data dir exists (persists for the life of the instance)
+try { fs.mkdirSync(cfg.dataDir, { recursive: true }); } catch {}
 
-export async function getTopWallets() {
-  let wallets = [];
-  if (cfg.walletSource === 'solanatracker') {
-    wallets = await fetchFromSolanaTracker(cfg.topWallets);
-  } else {
-    throw new Error(`Unknown WALLET_SOURCE=${cfg.walletSource}`);
+const CACHE_PATH = path.join(cfg.dataDir, cfg.topWalletsCacheFile);
+
+/**
+ * Fetch TOP PAGE ONLY from SolanaTracker sorted by winPercentage.
+ * We do NOT filter at fetch time — we normalize, cache, and return raw.
+ *
+ * Endpoint:
+ *   GET /top-traders/all
+ *
+ * Query params:
+ *   sortBy=winPercentage
+ *   expandPnl=false
+ *
+ * Response shape (example):
+ * {
+ *   "wallets": [
+ *     { "wallet": "...", "summary": { "winPercentage": 33.05, "totalWins": 423, ... } },
+ *     ...
+ *   ]
+ * }
+ */
+async function fetchTopTradersTopPageST() {
+  if (!cfg.stApiKey) throw new Error('ST_API_KEY missing – set your SolanaTracker API key.');
+
+  const url = new URL(`${cfg.stBaseUrl}/top-traders/all`);
+  url.searchParams.set('sortBy', 'winPercentage');
+  url.searchParams.set('expandPnl', 'false');
+
+  const res = await fetch(url.toString(), {
+    headers: { 'x-api-key': cfg.stApiKey },
+    timeout: 15_000
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`SolanaTracker error ${res.status}: ${text || res.statusText}`);
   }
 
-  // Filter + sort by win rate then some tie-breaker (e.g., trades)
-  const filtered = wallets
-    .filter(w => typeof w.winRate === 'number' && w.winRate >= cfg.minWinRate)
-    .sort((a, b) => (b.winRate - a.winRate) || ((b.trades||0) - (a.trades||0)))
+  const data = await res.json();
+  const wallets = Array.isArray(data?.wallets) ? data.wallets : [];
+
+  // Normalize to local shape; ST winPercentage is 0–100 (e.g., 36.27)
+  const normalized = wallets.map(w => ({
+    address: w?.wallet,
+    winRatePercent: Number(w?.summary?.winPercentage ?? 0)
+  })).filter(x => !!x.address);
+
+  return normalized;
+}
+
+/** Try cache if fresh */
+function readCache() {
+  try {
+    if (!fs.existsSync(CACHE_PATH)) return null;
+    const raw = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
+    if (!raw || !raw.ts || !Array.isArray(raw.items)) return null;
+    const ageMs = Date.now() - Number(raw.ts);
+    if (ageMs > cfg.topWalletsTtlMinutes * 60_000) return null;
+    return raw.items;
+  } catch {
+    return null;
+  }
+}
+
+/** Write cache (best-effort) */
+function writeCache(items) {
+  try {
+    fs.writeFileSync(CACHE_PATH, JSON.stringify({ ts: Date.now(), items }), 'utf8');
+  } catch {
+    // ignore fs errors on ephemeral disks
+  }
+}
+
+/**
+ * Local filter & pick:
+ *  - Take first cfg.topWallets entries from raw top page,
+ *  - Filter by winPercentage >= cfg.minWinRatePercent ONLY,
+ *  - Sort by winPercentage desc,
+ *  - Take cfg.trackTopN addresses.
+ */
+function filterAndPick(topPageRaw) {
+  const topSlice = topPageRaw.slice(0, cfg.topWallets);
+
+  const filtered = topSlice
+    .filter(i => Number.isFinite(i.winRatePercent))
+    .filter(i => i.winRatePercent >= cfg.minWinRatePercent)
+    .sort((a, b) => b.winRatePercent - a.winRatePercent)
     .slice(0, cfg.trackTopN);
 
-  if (!filtered.length) log.warn('No wallets passed filtering. Using empty list.');
-  return filtered.map(w => w.address);
+  const addresses = filtered.map(i => i.address);
+
+  log.info({
+    considered: topSlice.length,
+    selected: addresses.length,
+    minWinRatePercent: cfg.minWinRatePercent
+  }, 'SolanaTracker selection (filtered by winPercentage)');
+
+  return addresses;
+}
+
+/**
+ * Public: getTopWallets
+ *  - Use cache if fresh,
+ *  - Else fetch once, cache raw result,
+ *  - Then apply local filtering by winPercentage and return addresses.
+ */
+export async function getTopWallets() {
+  // 1) Try cache
+  const cached = readCache();
+  if (cached?.length) {
+    return filterAndPick(cached);
+  }
+
+  // 2) Fetch from ST (top page only)
+  let rawTop = [];
+  try {
+    rawTop = await fetchTopTradersTopPageST();
+  } catch (e) {
+    // If ST fails and there’s no cache, return empty list
+    log.error(e, 'Failed to fetch from SolanaTracker');
+    return [];
+  }
+
+  // 3) Cache raw result to avoid rinsing the API
+  writeCache(rawTop);
+
+  // 4) Filter locally & pick
+  return filterAndPick(rawTop);
 }
