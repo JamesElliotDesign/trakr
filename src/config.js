@@ -13,23 +13,22 @@ export const cfg = {
   tgToken: process.env.TELEGRAM_BOT_TOKEN,
   tgChatId: process.env.TELEGRAM_CHAT_ID,
 
-  // --- SolanaTracker (Top Traders only; keep usage low) ---
-  walletSource: 'solanatracker',
+  // --- SolanaTracker ---
   stApiKey: process.env.ST_API_KEY,
   stBaseUrl: 'https://data.solanatracker.io',
-
-  // selection & API usage
-  minWinRatePercent: parseFloat(process.env.MIN_WIN_RATE_PERCENT || '35'), // win% threshold (0–100)
-  topWallets: parseInt(process.env.TOP_WALLETS || '20', 10),               // consider first N from top page
-  trackTopN: parseInt(process.env.TRACK_TOP_N || '10', 10),                // subscribe to best N
-  activeWithinHours: parseInt(process.env.ACTIVE_WITHIN_HOURS || '24', 10),// require activity within N hours
+  // use the same idea as the working snippet:
+  // take the most profitable wallets within a short window (implies activity)
+  stWindow: process.env.ST_WINDOW || '1d', // '1d' or '3d' etc.
+  topWallets: parseInt(process.env.TOP_WALLETS || '20', 10), // consider first N from result page
+  trackTopN: parseInt(process.env.TRACK_TOP_N || '10', 10),  // subscribe to best N
+  minWinRatePercent: parseFloat(process.env.MIN_WIN_RATE_PERCENT || '35'), // 0–100
 
   // cache to avoid rinsing free tier
   dataDir: process.env.DATA_DIR || './data',
   topWalletsCacheFile: process.env.TOP_WALLETS_CACHE_FILE || 'top_wallets.json',
   topWalletsTtlMinutes: parseInt(process.env.TOP_WALLETS_TTL_MIN || '60', 10), // refresh hourly
 
-  // --- Price provider preference (kept for later stages) ---
+  // --- Price provider preference ---
   priceProviderPref: process.env.PRICE_PROVIDER_PREF || 'gmgn',
 
   // --- Buy detection heuristics ---
