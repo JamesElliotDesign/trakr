@@ -1,3 +1,4 @@
+// src/index.js
 import express from 'express';
 import pino from 'pino';
 import { cfg } from './config.js';
@@ -22,11 +23,12 @@ async function bootstrap() {
   app.post('/helius-webhook', async (req, res) => {
     try {
       if (!verifyHeliusRequest(req)) return res.status(401).send('bad sig');
+
       const events = Array.isArray(req.body) ? req.body : [req.body];
       for (const enhancedTx of events) {
         const buys = detectBuys(enhancedTx, trackedSet, seenCache);
         for (const b of buys) {
-          const p = await getSpotPriceUsd(b.mint);
+          const p = await getSpotPriceUsd(b.mint, { amount: b.amount, solSpent: b.solSpent ?? undefined });
           await sendSignal({
             wallet: b.wallet,
             mint: b.mint,
@@ -38,6 +40,7 @@ async function bootstrap() {
           log.info({ ...b, price: p?.priceUsd ?? null }, 'Signal sent');
         }
       }
+
       res.json({ ok: true });
     } catch (e) {
       log.error(e, 'webhook error');
@@ -52,7 +55,7 @@ async function bootstrap() {
 
   async function refreshTracked(sendTg = false) {
     try {
-      const selection = await getTopWallets(); // [{address, winRatePercent, lastActiveMsAgo}]
+      const selection = await getTopWallets();
       latestSelection = selection;
 
       trackedSet.clear();
@@ -61,9 +64,7 @@ async function bootstrap() {
       log.info({ count: trackedSet.size }, 'Tracking wallets');
 
       if (addresses.length === 0) {
-        if (sendTg) {
-          await sendTrackingSummary([]); // will show 0 tracked
-        }
+        if (sendTg) await sendTrackingSummary([]);
         log.warn('No active wallets found within window; skipping Helius upsert');
         return;
       }
@@ -71,9 +72,7 @@ async function bootstrap() {
       const id = await upsertHeliusWebhook(addresses);
       log.info({ webhookId: id }, 'Helius webhook upserted');
 
-      if (sendTg) {
-        await sendTrackingSummary(selection);
-      }
+      if (sendTg) await sendTrackingSummary(selection);
     } catch (err) {
       log.error({ err }, 'Initial refresh failed');
     }
@@ -97,6 +96,7 @@ async function bootstrap() {
 }
 
 bootstrap().catch(err => {
+  // eslint-disable-next-line no-console
   console.error(err);
   process.exit(1);
 });

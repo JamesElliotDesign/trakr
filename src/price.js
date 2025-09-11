@@ -1,131 +1,91 @@
 // src/price.js
 import fetch from 'node-fetch';
 import pino from 'pino';
+import { cfg } from './config.js';
+
 const log = pino({ transport: { target: 'pino-pretty' }});
 
-/**
- * Primary: Jupiter Price API V3 (Lite/Pro)
- *  - Docs: https://dev.jup.ag/docs/price-api/v3  (overview)
- *  - Endpoint: Lite  https://lite-api.jup.ag/price/v3
- *               Pro  https://api.jup.ag/price/v3  (set JUP_API_KEY to use)
- *
- * Fallback: Birdeye Public Price
- *  - Endpoint: https://public-api.birdeye.so/defi/price?address=<mint>
- *  - Optional key: set BIRDEYE_API_KEY to raise rate limits
- */
+const JUP_LITE = 'https://lite-api.jup.ag/price/v3';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-const JUP_LITE_URL = 'https://lite-api.jup.ag/price/v3';
-const JUP_PRO_URL  = 'https://api.jup.ag/price/v3'; // requires x-api-key
-const JUP_API_KEY = process.env.JUP_API_KEY || '';
+// Optional Birdeye fallback if you later provide a key
+const BE_BASE = 'https://public-api.birdeye.so/defi/price';
 
-const BIRDEYE_URL = 'https://public-api.birdeye.so/defi/price';
-const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
-
-/**
- * Try Jupiter v3 (Lite/Pro). V3 schema returns an object keyed by mint.
- * Historically (v2) it returned { data: { <mint>: { price } } }.
- * We'll support both just in case.
- */
-async function getFromJupiter(mint) {
-  const base = JUP_API_KEY ? JUP_PRO_URL : JUP_LITE_URL;
-  const url = new URL(base);
-  // V3 expects "ids" (comma-separated mints)
-  url.searchParams.set('ids', mint);
-
+async function jupPriceUsd(mint) {
   try {
-    const res = await fetch(url.toString(), {
-      headers: JUP_API_KEY ? { 'x-api-key': JUP_API_KEY } : undefined,
-      // reasonable timeout
-      timeout: 12_000
+    const url = `${JUP_LITE}?ids=${encodeURIComponent(mint)}`;
+    const res = await fetch(url, { timeout: 2500 });
+    if (!res.ok) return null;
+    const j = await res.json();
+    const row = j?.[mint];
+    const price = Number(row?.usdPrice);
+    return Number.isFinite(price) ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+async function jupSolUsd() {
+  return jupPriceUsd(SOL_MINT);
+}
+
+async function birdeyePriceUsd(mint) {
+  try {
+    if (!process.env.BIRDEYE_API_KEY) return null;
+    const url = `${BE_BASE}?address=${encodeURIComponent(mint)}`;
+    const res = await fetch(url, {
+      headers: {
+        accept: 'application/json',
+        'x-api-key': process.env.BIRDEYE_API_KEY
+      },
+      timeout: 2500
     });
-
     if (!res.ok) {
       const t = await res.text().catch(() => '');
-      throw new Error(`Jupiter ${res.status}: ${t || res.statusText}`);
+      log.warn({ mint, err: `Birdeye ${res.status}: ${t}` }, 'Birdeye price failed');
+      return null;
     }
-
     const j = await res.json();
-
-    // Normalize — try V3 shape first, then V2-like shape
-    // V3: { data: { [mint]: { price: number, ... } }, timeMs?: ... } OR sometimes top-level mapping
-    const data = j?.data && typeof j.data === 'object' ? j.data : j;
-    const rec = data?.[mint];
-    const price = Number(rec?.price);
-    if (Number.isFinite(price)) {
-      return { priceUsd: price, ts: Date.now(), source: JUP_API_KEY ? 'jupiter-pro' : 'jupiter-lite' };
-    }
-
-    // Some cases might nest differently; attempt a generic scan
-    const maybe = findFirstPriceNumber(data);
-    if (maybe != null) {
-      return { priceUsd: maybe, ts: Date.now(), source: JUP_API_KEY ? 'jupiter-pro' : 'jupiter-lite' };
-    }
-
-    return null;
-  } catch (e) {
-    log.warn({ mint, err: e.message }, 'Jupiter price failed');
+    const price = Number(j?.data?.value);
+    return Number.isFinite(price) ? price : null;
+  } catch {
     return null;
   }
 }
 
 /**
- * Fallback: Birdeye public price
- *  Response: { data: { value: number, price?: number, updateUnixTime?: number } }
+ * Try to get a spot USD price for a token:
+ *  1) Jupiter Price V3
+ *  2) If missing and we have trade context: price = (solSpent / amount) * SOL_USD
+ *  3) Optional Birdeye fallback (only if key provided)
+ *
+ * @param {string} mint
+ * @param {{ amount?: number, solSpent?: number }} [ctx]
+ * @returns {{ priceUsd: number|null, source: string|null }}
  */
-async function getFromBirdeye(mint) {
-  try {
-    const u = new URL(BIRDEYE_URL);
-    u.searchParams.set('address', mint);
-
-    const headers = {};
-    if (BIRDEYE_API_KEY) headers['X-API-KEY'] = BIRDEYE_API_KEY;
-
-    const res = await fetch(u.toString(), { headers, timeout: 10_000 });
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      throw new Error(`Birdeye ${res.status}: ${t || res.statusText}`);
-    }
-
-    const j = await res.json();
-    const v = j?.data?.value ?? j?.data?.price;
-    const price = Number(v);
-    if (Number.isFinite(price)) {
-      const ts = Number(j?.data?.updateUnixTime) * 1000 || Date.now();
-      return { priceUsd: price, ts, source: 'birdeye' };
-    }
-
-    return null;
-  } catch (e) {
-    log.warn({ mint, err: e.message }, 'Birdeye price failed');
-    return null;
+export async function getSpotPriceUsd(mint, ctx = {}) {
+  // 1) Jupiter direct
+  const j = await jupPriceUsd(mint);
+  if (Number.isFinite(j)) {
+    return { priceUsd: j, source: 'jupiter' };
   }
-}
 
-/** Utility: scan an object for a numeric `price` field */
-function findFirstPriceNumber(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  if (Number.isFinite(obj.price)) return Number(obj.price);
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') {
-      const nested = findFirstPriceNumber(v);
-      if (nested != null) return nested;
+  // 2) Derive from swap context if possible
+  if (Number.isFinite(ctx?.solSpent) && Number.isFinite(ctx?.amount) && ctx.amount > 0) {
+    const solUsd = await jupSolUsd();
+    if (Number.isFinite(solUsd)) {
+      const price = (ctx.solSpent / ctx.amount) * solUsd;
+      if (Number.isFinite(price) && price > 0) {
+        return { priceUsd: price, source: 'derived(sol*usd/amount)' };
+      }
     }
   }
-  return null;
-}
 
-/**
- * Public API
- *  - Returns { priceUsd, ts, source } or null
- */
-export async function getSpotPriceUsd(mint) {
-  // 1) Jupiter v3 (Lite/Pro)
-  let p = await getFromJupiter(mint);
-  if (p) return p;
+  // 3) Optional Birdeye fallback
+  const be = await birdeyePriceUsd(mint);
+  if (Number.isFinite(be)) {
+    return { priceUsd: be, source: 'birdeye' };
+  }
 
-  // 2) Birdeye fallback
-  p = await getFromBirdeye(mint);
-  if (p) return p;
-
-  return null;
+  return { priceUsd: null, source: null };
 }
