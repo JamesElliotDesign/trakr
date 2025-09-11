@@ -3,15 +3,54 @@ import pino from 'pino';
 import { cfg } from './config.js';
 
 const log = pino({ transport: { target: 'pino-pretty' }});
-
 const LAMPORTS_PER_SOL = 1_000_000_000n;
+
+/* --------------------------- cache helpers --------------------------- */
+// Works with Set, Map, or plain object.
+// Stores a timestamp so we can debounce within cfg.buyDebounceMinutes.
+
+function cacheHas(cache, key) {
+  if (!cache) return false;
+  if (typeof cache.has === 'function') return cache.has(key);
+  if (typeof cache.get === 'function') return cache.get(key) != null;
+  return Object.prototype.hasOwnProperty.call(cache, key);
+}
+
+function cacheGet(cache, key) {
+  if (!cache) return undefined;
+  if (typeof cache.get === 'function') return cache.get(key);
+  if (cacheHas(cache, key)) return cache[key];
+  return undefined;
+}
+
+function cacheSet(cache, key, value) {
+  if (!cache) return;
+  if (typeof cache.set === 'function') { cache.set(key, value); return; }
+  if (typeof cache.add === 'function') { cache.add(key); return; } // Set without TTL (fallback)
+  cache[key] = value;
+}
+
+function debounced(cache, key, windowMs) {
+  const now = Date.now();
+  const last = Number(cacheGet(cache, key) || 0);
+  if (now - last < windowMs) return true;
+  cacheSet(cache, key, now);
+  return false;
+}
+
+/* --------------------------- small utilities ------------------------ */
 
 function isExcludedMint(mint) {
   return cfg.excludedMints.has(mint);
 }
 
+function safeNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
- * Extract total SOL spent by `wallet` in this enhanced transaction.
+ * Sum outgoing SOL from the tracked wallet in this enhanced transaction.
  * Uses enhancedTx.nativeTransfers[].amount (lamports) where fromUserAccount===wallet.
  */
 function extractSolSpentSOL(enhancedTx, wallet) {
@@ -19,15 +58,15 @@ function extractSolSpentSOL(enhancedTx, wallet) {
     const nt = Array.isArray(enhancedTx?.nativeTransfers) ? enhancedTx.nativeTransfers : [];
     let lamports = 0n;
     for (const t of nt) {
-      if (t?.fromUserAccount === wallet && typeof t.amount === 'number') {
-        lamports += BigInt(Math.max(0, t.amount));
-      } else if (t?.fromUserAccount === wallet && typeof t.amount === 'string') {
-        const v = BigInt(t.amount);
-        lamports += v > 0n ? v : 0n;
+      if (t?.fromUserAccount === wallet) {
+        // amount can be number or string
+        const raw = typeof t.amount === 'string' ? BigInt(t.amount)
+                  : typeof t.amount === 'number' ? BigInt(Math.max(0, t.amount))
+                  : 0n;
+        if (raw > 0n) lamports += raw;
       }
     }
     if (lamports === 0n) return null;
-    // convert to SOL with decimal precision
     const sol = Number(lamports) / Number(LAMPORTS_PER_SOL);
     return Number.isFinite(sol) ? sol : null;
   } catch {
@@ -35,58 +74,57 @@ function extractSolSpentSOL(enhancedTx, wallet) {
   }
 }
 
+/* --------------------------- main detector -------------------------- */
 /**
  * Detect buys for tracked wallets from a Helius enhanced tx.
- * Returns array of { wallet, mint, amount, signature, solSpent? }.
+ * Priority: tokenTransfers where the tracked wallet is the receiver of non-excluded SPL tokens.
+ * Debounce key: (wallet|mint) across cfg.buyDebounceMinutes to avoid duplicate signals from the same tx.
+ *
+ * Returns array of:
+ *   { wallet, mint, amount, signature, solSpent, txType }
  */
-export function detectBuys(enhancedTx, trackedSet /* Set<string> */, seenCache) {
+export function detectBuys(enhancedTx, trackedSet, seenCache) {
   const out = [];
+  const sig = enhancedTx?.signature || enhancedTx?.transactionSignature || '';
+  const type = (enhancedTx?.type || '').toUpperCase();
 
   try {
-    const sig = enhancedTx?.signature || enhancedTx?.transactionSignature || '';
-    const tt = Array.isArray(enhancedTx?.tokenTransfers) ? enhancedTx.tokenTransfers : [];
-    const type = (enhancedTx?.type || '').toUpperCase();
+    const transfers = Array.isArray(enhancedTx?.tokenTransfers) ? enhancedTx.tokenTransfers : [];
+    if (!transfers.length) return out;
 
-    // Skip stables
-    const filtered = tt.filter(x => x?.mint && !isExcludedMint(x.mint));
-
-    // Heuristic: treat as buy when wallet receives tokens (toUserAccount owner is in trackedSet)
-    for (const t of filtered) {
-      const toOwner = t?.toUserAccount || t?.toUserAccountOwner || t?.toUser?.owner;
-      const fromOwner = t?.fromUserAccount || t?.fromUserAccountOwner || t?.fromUser?.owner;
-
-      // token amount is usually in raw units; prefer uiAmount if present
-      const amount =
-        Number.isFinite(t?.tokenAmount) ? Number(t.tokenAmount)
-        : Number.isFinite(t?.amount) ? Number(t.amount)
-        : Number.isFinite(t?.uiTokenAmount) ? Number(t.uiTokenAmount)
-        : Number.isFinite(t?.tokenAmountSent) ? Number(t.tokenAmountSent)
-        : null;
-
-      const wallet =
-        trackedSet.has(toOwner) ? toOwner :
-        trackedSet.has(fromOwner) ? fromOwner :
-        null;
-
-      if (!wallet || !amount || amount <= 0) continue;
-
-      // if the tracked wallet is the receiver of tokens => "buy"
-      const isReceiver = trackedSet.has(toOwner);
-      if (!isReceiver) continue;
-
-      const mint = t.mint;
+    // Only SPL token incoming to tracked wallet
+    for (const t of transfers) {
+      const mint = t?.mint;
       if (!mint || isExcludedMint(mint)) continue;
 
-      // debounce same (wallet+mint+sig) once
-      const key = `${wallet}:${mint}:${sig}`;
-      if (seenCache.has(key)) continue;
-      seenCache.add(key);
+      const toOwner =
+        t?.toUserAccount ||
+        t?.toUserAccountOwner ||
+        t?.toUser?.owner ||
+        t?.tokenAccountToOwner ||
+        null;
 
-      // derive SOL spent from nativeTransfers
-      const solSpent = extractSolSpentSOL(enhancedTx, wallet);
+      if (!toOwner || !trackedSet.has(toOwner)) continue;
+
+      // Prefer precise fields in order
+      const amount =
+        safeNum(t?.uiTokenAmount) ??
+        safeNum(t?.tokenAmount) ??
+        safeNum(t?.amount) ??
+        safeNum(t?.tokenAmountSent) ??
+        null;
+
+      if (!amount || amount <= 0 || amount < (cfg.minTokenAmount || 0)) continue;
+
+      // Debounce per (wallet:mint) across a time window
+      const key = `buy:${toOwner}:${mint}`;
+      const windowMs = (cfg.buyDebounceMinutes || 30) * 60 * 1000;
+      if (debounced(seenCache, key, windowMs)) continue;
+
+      const solSpent = extractSolSpentSOL(enhancedTx, toOwner);
 
       out.push({
-        wallet,
+        wallet: toOwner,
         mint,
         amount,
         signature: sig,
@@ -97,6 +135,8 @@ export function detectBuys(enhancedTx, trackedSet /* Set<string> */, seenCache) 
 
     if (out.length) {
       log.info({ sig, buys: out }, 'Detected buy(s)');
+    } else {
+      log.debug({ sig }, 'No buys detected');
     }
   } catch (e) {
     log.warn({ err: e?.message }, 'buyDetector failed softly');
