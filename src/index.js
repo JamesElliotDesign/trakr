@@ -1,4 +1,3 @@
-// src/index.js
 import express from 'express';
 import pino from 'pino';
 import { cfg } from './config.js';
@@ -15,9 +14,7 @@ async function bootstrap() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  // In-memory tracked set for quick lookups
   const trackedSet = new Set();
-  // Keep a copy of latest selection with win rates for TG summaries
   let latestSelection = [];
 
   app.get('/health', (_, res) => res.json({ ok: true }));
@@ -25,7 +22,6 @@ async function bootstrap() {
   app.post('/helius-webhook', async (req, res) => {
     try {
       if (!verifyHeliusRequest(req)) return res.status(401).send('bad sig');
-
       const events = Array.isArray(req.body) ? req.body : [req.body];
       for (const enhancedTx of events) {
         const buys = detectBuys(enhancedTx, trackedSet, seenCache);
@@ -42,7 +38,6 @@ async function bootstrap() {
           log.info({ ...b, price: p?.priceUsd ?? null }, 'Signal sent');
         }
       }
-
       res.json({ ok: true });
     } catch (e) {
       log.error(e, 'webhook error');
@@ -50,7 +45,6 @@ async function bootstrap() {
     }
   });
 
-  // Admin: manually refresh wallets (force) and push TG summary
   app.post('/admin/refresh-wallets', async (_req, res) => {
     await refreshTracked(true);
     res.json({ ok: true, tracked: latestSelection.map(x => x.address) });
@@ -58,22 +52,26 @@ async function bootstrap() {
 
   async function refreshTracked(sendTg = false) {
     try {
-      // 1) fetch selection (address + win rate)
-      const selection = await getTopWallets(); // [{address, winRatePercent}]
+      const selection = await getTopWallets(); // [{address, winRatePercent, lastActiveMsAgo}]
       latestSelection = selection;
 
-      // 2) update in-memory set
       trackedSet.clear();
       const addresses = selection.map(s => s.address);
       addresses.forEach(w => trackedSet.add(w));
       log.info({ count: trackedSet.size }, 'Tracking wallets');
 
-      // 3) upsert SINGLE Helius webhook with ALL wallets
+      if (addresses.length === 0) {
+        if (sendTg) {
+          await sendTrackingSummary([]); // will show 0 tracked
+        }
+        log.warn('No active wallets found within window; skipping Helius upsert');
+        return;
+      }
+
       const id = await upsertHeliusWebhook(addresses);
       log.info({ webhookId: id }, 'Helius webhook upserted');
 
-      // 4) optional TG summary
-      if (sendTg && selection.length) {
+      if (sendTg) {
         await sendTrackingSummary(selection);
       }
     } catch (err) {
@@ -81,7 +79,6 @@ async function bootstrap() {
     }
   }
 
-  // graceful shutdown persists the seen cache JSON
   function shutdown() {
     try { flushSeenSync(); } catch {}
     process.exit(0);
@@ -89,14 +86,10 @@ async function bootstrap() {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  // Boot
   await preloadSeen();
   app.listen(cfg.port, async () => {
     log.info(`Signals service listening on :${cfg.port}`);
-    // Initial refresh + Telegram summary on boot
     await refreshTracked(true);
-
-    // Hourly refresh of wallets (no TG spam here; keep it quiet)
     setInterval(async () => {
       try { await refreshTracked(false); } catch {}
     }, 60 * 60 * 1000);
@@ -104,7 +97,6 @@ async function bootstrap() {
 }
 
 bootstrap().catch(err => {
-  // eslint-disable-next-line no-console
   console.error(err);
   process.exit(1);
 });
