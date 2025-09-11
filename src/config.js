@@ -17,18 +17,19 @@ export const cfg = {
   walletSource: 'solanatracker',
   stApiKey: process.env.ST_API_KEY,
   stBaseUrl: 'https://data.solanatracker.io',
-  // selection + API usage guards
-  minWinRatePercent: parseFloat(process.env.MIN_WIN_RATE_PERCENT || '35'), // e.g., 35 means 35%
-  minTrades: parseInt(process.env.MIN_TRADES || '30', 10),                 // wins+losses minimum
-  topWallets: parseInt(process.env.TOP_WALLETS || '20', 10),               // consider up to first N from ST
+
+  // selection & API usage
+  minWinRatePercent: parseFloat(process.env.MIN_WIN_RATE_PERCENT || '35'), // win% threshold (0–100)
+  topWallets: parseInt(process.env.TOP_WALLETS || '20', 10),               // consider first N from top page
   trackTopN: parseInt(process.env.TRACK_TOP_N || '10', 10),                // subscribe to best N
-  stMaxPages: parseInt(process.env.ST_MAX_PAGES || '1', 10),               // fetch at most this many pages
+  activeWithinHours: parseInt(process.env.ACTIVE_WITHIN_HOURS || '24', 10),// require activity within N hours
+
   // cache to avoid rinsing free tier
   dataDir: process.env.DATA_DIR || './data',
   topWalletsCacheFile: process.env.TOP_WALLETS_CACHE_FILE || 'top_wallets.json',
   topWalletsTtlMinutes: parseInt(process.env.TOP_WALLETS_TTL_MIN || '60', 10), // refresh hourly
 
-  // --- Price provider preference (for later copy-trading stage) ---
+  // --- Price provider preference (kept for later stages) ---
   priceProviderPref: process.env.PRICE_PROVIDER_PREF || 'gmgn',
 
   // --- Buy detection heuristics ---
