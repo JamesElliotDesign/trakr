@@ -69,13 +69,9 @@ export async function executeBuy({ mint }) {
   const qtyAtoms = typeof received === 'bigint' ? received : null;
 
   // Telegram notice (keep payload shape stable)
-  await sendEntryNotice({
-    mint,
-    price: entryPriceUsd ?? null,
-    solSpent: Number(amountLamports) / 1e9,
-    txid: signature,
-    mode: 'live',
-  }).catch(() => { /* best effort */ });
+  // NOTICE: positions module will send the OPENED notification.
+// (Avoid duplicate Telegram messages.)
+
 
   log.info(
     { mint, signature, route: routeSummary || {}, qtyAtoms: qtyAtoms ? String(qtyAtoms) : null, entryPriceUsd },

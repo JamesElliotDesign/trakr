@@ -56,22 +56,40 @@ export async function buyViaPumpTradeLocal({
   const { signature, endpointUsed } = await broadcastAndConfirmWithEndpoint(tx.serialize());
 
   // Use the same endpoint to fetch tx meta (avoids 401/invalid key mismatches)
-  const conn = new Connection(endpointUsed || cfg.rpcUrl, 'confirmed');
+  // Use the same endpoint to fetch tx meta (avoids 401/invalid key mismatches)
+const conn = new Connection(endpointUsed || cfg.rpcUrl, 'confirmed');
 
-  const txInfo = await conn.getTransaction(signature, {
-    commitment: 'confirmed',
-    maxSupportedTransactionVersion: 0
-  }).catch(() => null);
-
-  if (!txInfo || !txInfo.meta) {
-    return {
-      signature,
-      qtyAtoms: null,
-      decimals: null,
-      entryPriceUsd: null,
-      routeSummary: { strategy: 'pump-trade-local', endpointUsed: endpointUsed || null }
-    };
+// Retry helper: try a few times at 'confirmed', then a few at 'finalized'
+async function getTxWithMeta(sig) {
+  const tries = [
+    { commitment: 'confirmed', attempts: 4, backoffMs: 200 },
+    { commitment: 'finalized', attempts: 4, backoffMs: 300 }
+  ];
+  for (const tier of tries) {
+    for (let i = 0; i < tier.attempts; i++) {
+      const info = await conn.getTransaction(sig, {
+        commitment: tier.commitment,
+        maxSupportedTransactionVersion: 0
+      }).catch(() => null);
+      if (info?.meta?.postTokenBalances?.length) return info;
+      await new Promise(r => setTimeout(r, tier.backoffMs * (i + 1)));
+    }
   }
+  return null;
+}
+
+const txInfo = await getTxWithMeta(signature);
+
+if (!txInfo || !txInfo.meta) {
+  return {
+    signature,
+    qtyAtoms: null,
+    decimals: null,
+    entryPriceUsd: null,
+    routeSummary: { strategy: 'pump-trade-local', endpointUsed: endpointUsed || null }
+  };
+}
+
 
   const owner = user.publicKey.toBase58();
   const pre = txInfo.meta.preTokenBalances || [];
