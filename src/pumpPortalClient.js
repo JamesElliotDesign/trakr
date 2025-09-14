@@ -205,3 +205,50 @@ export async function sellAllViaPumpTradeLocal({
     routeSummary: { strategy: 'pump-trade-local', endpointUsed: endpointUsed || null }
   };
 }
+
+// === INSERTED HERE: sellViaPumpTradeLocal, directly after buyViaPumpTradeLocal ===
+export async function sellViaPumpTradeLocal({
+  mint,
+  percent = '100%',
+  slippageBps = DEFAULT_SLIPPAGE_BPS,
+  priorityFeeSol = DEFAULT_PRIORITY_FEE_SOL,
+  pool = DEFAULT_POOL
+}) {
+  const user = ensureSigner();
+
+  const slippagePercent = slippageBps / 100;
+
+  const body = {
+    publicKey: user.publicKey.toBase58(),
+    action: 'sell',
+    mint,
+    amount: percent,              // e.g. "100%" (sell all)
+    denominatedInSol: 'false',    // selling tokens, not SOL
+    slippage: slippagePercent,    // %
+    priorityFee: priorityFeeSol,  // SOL
+    pool
+  };
+
+  const res = await fetch(TRADE_LOCAL_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`pump trade-local sell failed: ${res.status} ${t || res.statusText}`);
+  }
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  const tx = VersionedTransaction.deserialize(new Uint8Array(buf));
+  tx.sign([user]);
+
+  const { signature, endpointUsed } = await broadcastAndConfirmWithEndpoint(tx.serialize());
+
+  return {
+    txid: signature,
+    signature,
+    routeSummary: { strategy: 'pump-trade-local', endpointUsed: endpointUsed || null }
+  };
+}

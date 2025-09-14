@@ -6,6 +6,7 @@ import { ensureSigner } from './keypair.js';
 import { swapExactIn } from './jupiterClient.js';
 import { PublicKey, Connection } from '@solana/web3.js';
 import { sendExitNotice } from './telegram.js';
+import { sellViaPumpTradeLocal } from './pumpPortalClient.js';
 
 const log = pino({ transport: { target: 'pino-pretty' }});
 
@@ -73,7 +74,7 @@ export async function executeBuy({ mint }) {
     slippageBps: cfg.jupSlippageBps ?? 150
   });
 
-  // Prefer precise entry price from swap (pump-trade-local derivation). Otherwise use spot.
+  // Prefer precise entry price from swap; otherwise use spot.
   let entryPriceUsd = null;
   if (typeof priceUsd === 'number' && Number.isFinite(priceUsd)) {
     entryPriceUsd = priceUsd;
@@ -91,9 +92,6 @@ export async function executeBuy({ mint }) {
     'BUY filled'
   );
 
-  // NOTE: We no longer send the "OPENED" Telegram here to avoid duplicates.
-  // Your positions module should announce the open with the stored entry/qty.
-
   return {
     ok: true,
     txid: signature,
@@ -105,34 +103,75 @@ export async function executeBuy({ mint }) {
 }
 
 /**
- * SELL: sell `qty` (token atoms) of `mint` to SOL.
- * If `qty` is missing, we auto-resolve it from the wallet's on-chain balance.
+ * SELL: sell tokens of `mint` to SOL.
+ * If `qty` is missing, auto-resolve from wallet. For pump tokens (or when PUMP_FALLBACK=true)
+ * we use Pump Portal trade-local (action: "sell") with "100%" by default to avoid decimals math.
  * Returns: { ok: true, txid }
  */
-export async function executeSell({ mint, qty }) {
+export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
   if (!isLive()) {
-    log.info({ mint, qty: qty == null ? '(auto-resolve)' : String(qty) }, '[paper] Skipping live sell (paper mode)');
+    log.info(
+      { mint, qty: qty == null ? '(auto-resolve)' : String(qty) },
+      '[paper] Skipping live sell (paper mode)'
+    );
     return { ok: true, mode: 'paper', txid: null };
   }
 
   const kp = ensureSigner();
-  let sellQty = qty;
 
+  // Decide routing: use Pump Portal for pump mints or when PUMP_FALLBACK=true
+  const isPumpMint = typeof mint === 'string' && mint.endsWith('pump');
+  const pumpFallback = String(process.env.PUMP_FALLBACK || '').toLowerCase() === 'true';
+  const shouldUsePump = isPumpMint || pumpFallback;
+
+  if (shouldUsePump) {
+    try {
+      // Prefer selling 100% by default; avoids needing token decimals/qtyAtoms.
+      const pct = sellAll ? '100%' : (percent || '100%');
+      const filled = await sellViaPumpTradeLocal({
+        mint,
+        percent: pct,
+        slippageBps: Number(process.env.PUMP_SLIPPAGE_BPS || '200'),
+        priorityFeeSol: Number(process.env.PUMP_PRIORITY_FEE_SOL || '0.00001'),
+        pool: (process.env.PUMP_POOL || 'auto').trim()
+      });
+
+      log.info(
+        { mint, signature: filled.signature, route: filled.routeSummary || {}, sellAll: true },
+        'SELL filled (pump-portal)'
+      );
+
+      await sendExitNotice({
+        mint,
+        entry: null, // P&L module fills from stored position
+        exit: filled.exitPriceUsd ?? null, // may be null; watcher/close uses spot fallback
+        pnlPct: null,
+        reason: 'TP/SL or manual',
+        txid: filled.signature,
+        mode: 'live'
+      }).catch(() => { /* best effort */ });
+
+      return { ok: true, txid: filled.signature };
+    } catch (e) {
+      log.warn({ mint, err: e?.message }, 'pump sell failed; will try Jupiter as fallback');
+      // fall through to Jupiter
+    }
+  }
+
+  // Jupiter fallback (may have no route on fresh pump tokens)
+  let sellQty = qty;
   if (sellQty == null) {
-    // Auto-resolve from chain to avoid BigInt(undefined) crashes
     sellQty = await resolveSellQtyAtoms({
       rpcUrl: process.env.RPC_URL || process.env.RPC_URLS?.split(',')[0]?.trim() || cfg.rpcUrl,
       ownerPubkey: kp.publicKey.toBase58(),
       mint
     });
-
     if (sellQty === 0n) {
       log.warn({ mint }, 'No tokens found to sell');
       throw new Error('no tokens available to sell (balance 0)');
     }
   }
 
-  // Ensure BigInt
   const amountAtoms = typeof sellQty === 'bigint' ? sellQty : BigInt(sellQty);
 
   const { signature, priceUsd, routeSummary } = await swapExactIn({
@@ -145,14 +184,14 @@ export async function executeSell({ mint, qty }) {
 
   await sendExitNotice({
     mint,
-    entry: null, // your P&L module fills this from stored position
+    entry: null, // filled by positions on close
     exit: priceUsd ?? null,
     pnlPct: null,
     reason: 'TP/SL or manual',
     txid: signature,
-    mode: 'live',
+    mode: 'live'
   }).catch(() => { /* best effort */ });
 
-  log.info({ mint, signature, route: routeSummary || {} }, 'SELL filled');
+  log.info({ mint, signature, route: routeSummary || {}, sellAll: false, hasQtyAtoms: true }, 'SELL filled (jupiter)');
   return { ok: true, txid: signature };
 }
