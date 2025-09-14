@@ -17,8 +17,26 @@ function toLamports(sol) {
   return BigInt(Math.floor(Number(sol) * 1_000_000_000));
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+/** ---- Simple global throttle for trade calls (helps avoid 429s) ---- */
+let lastTradeAt = 0;
+const MIN_TRADE_INTERVAL_MS = Number(process.env.MIN_TRADE_INTERVAL_MS || cfg.minTradeIntervalMs || 1500);
+async function throttleTrades() {
+  const now = Date.now();
+  const wait = lastTradeAt + MIN_TRADE_INTERVAL_MS - now;
+  if (wait > 0) {
+    // small jitter to break sync bursts
+    const jitter = Math.floor(Math.random() * 200);
+    await sleep(wait + jitter);
+  }
+  lastTradeAt = Date.now();
+}
+
 /** Resolve wallet token balance (atoms) for a mint. Retries briefly if not yet indexed. */
-async function resolveSellQtyAtoms({ rpcUrl, ownerPubkey, mint }) {
+export async function resolveSellQtyAtoms({ rpcUrl, ownerPubkey, mint }) {
   const conn = new Connection(rpcUrl, 'confirmed');
   const owner = new PublicKey(ownerPubkey);
   const mintPk = new PublicKey(mint);
@@ -27,7 +45,6 @@ async function resolveSellQtyAtoms({ rpcUrl, ownerPubkey, mint }) {
     const resp = await conn.getParsedTokenAccountsByOwner(owner, { mint: mintPk }).catch(() => null);
     const list = resp?.value || [];
     if (!list.length) return 0n;
-    // Choose the largest parsed balance (some wallets have multiple accounts)
     let best = 0n;
     for (const it of list) {
       const ui = it.account.data?.parsed?.info?.tokenAmount;
@@ -37,16 +54,15 @@ async function resolveSellQtyAtoms({ rpcUrl, ownerPubkey, mint }) {
     return best;
   }
 
-  // Try a few times at confirmed, then finalized
   const tiers = [
-    { attempts: 3, backoffMs: 150, commitment: 'confirmed' },
-    { attempts: 3, backoffMs: 250, commitment: 'finalized' }
+    { attempts: 3, backoffMs: 150 },
+    { attempts: 3, backoffMs: 250 }
   ];
   for (const t of tiers) {
     for (let i = 0; i < t.attempts; i++) {
       const qty = await getBestBalance();
       if (qty > 0n) return qty;
-      await new Promise(r => setTimeout(r, t.backoffMs * (i + 1)));
+      await sleep(t.backoffMs * (i + 1));
     }
   }
   return 0n;
@@ -63,6 +79,7 @@ export async function executeBuy({ mint }) {
     return { ok: true, mode: 'paper', txid: null, entryPriceUsd: null, qtyAtoms: null, decimals: null };
   }
 
+  await throttleTrades();
   ensureSigner();
   const amountLamports = toLamports(cfg.buySolAmount);
 
@@ -104,8 +121,9 @@ export async function executeBuy({ mint }) {
 
 /**
  * SELL: sell tokens of `mint` to SOL.
- * If `qty` is missing, auto-resolve from wallet. For pump tokens (or when PUMP_FALLBACK=true)
- * we use Pump Portal trade-local (action: "sell") with "100%" by default to avoid decimals math.
+ * If `qty` is missing, auto-resolve from wallet.
+ * For pump tokens (or when PUMP_FALLBACK=true) try Pump Portal first with 100%,
+ * then fall back to Jupiter if needed.
  * Returns: { ok: true, txid }
  */
 export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
@@ -117,7 +135,10 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
     return { ok: true, mode: 'paper', txid: null };
   }
 
+  await throttleTrades();
+
   const kp = ensureSigner();
+  const rpcUrl = process.env.RPC_URL || process.env.RPC_URLS?.split(',')[0]?.trim() || cfg.rpcUrl;
 
   // Decide routing: use Pump Portal for pump mints or when PUMP_FALLBACK=true
   const isPumpMint = typeof mint === 'string' && mint.endsWith('pump');
@@ -126,7 +147,6 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
 
   if (shouldUsePump) {
     try {
-      // Prefer selling 100% by default; avoids needing token decimals/qtyAtoms.
       const pct = sellAll ? '100%' : (percent || '100%');
       const filled = await sellViaPumpTradeLocal({
         mint,
@@ -143,8 +163,8 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
 
       await sendExitNotice({
         mint,
-        entry: null, // P&L module fills from stored position
-        exit: filled.exitPriceUsd ?? null, // may be null; watcher/close uses spot fallback
+        entry: null,
+        exit: filled.exitPriceUsd ?? null,
         pnlPct: null,
         reason: 'TP/SL or manual',
         txid: filled.signature,
@@ -153,7 +173,14 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
 
       return { ok: true, txid: filled.signature };
     } catch (e) {
-      log.warn({ mint, err: e?.message }, 'pump sell failed; will try Jupiter as fallback');
+      const msg = String(e?.message || '');
+      // annotate rate limit so watcher can back off harder
+      if (msg.includes('429')) {
+        const err = new Error('RATE_LIMIT: ' + msg);
+        err.code = 'RATE_LIMIT';
+        throw err;
+      }
+      log.warn({ mint, err: msg }, 'pump sell failed; will try Jupiter as fallback');
       // fall through to Jupiter
     }
   }
@@ -162,13 +189,15 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
   let sellQty = qty;
   if (sellQty == null) {
     sellQty = await resolveSellQtyAtoms({
-      rpcUrl: process.env.RPC_URL || process.env.RPC_URLS?.split(',')[0]?.trim() || cfg.rpcUrl,
+      rpcUrl,
       ownerPubkey: kp.publicKey.toBase58(),
       mint
     });
     if (sellQty === 0n) {
       log.warn({ mint }, 'No tokens found to sell');
-      throw new Error('no tokens available to sell (balance 0)');
+      const err = new Error('no tokens available to sell (balance 0)');
+      err.code = 'NO_BALANCE';
+      throw err;
     }
   }
 
@@ -184,7 +213,7 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
 
   await sendExitNotice({
     mint,
-    entry: null, // filled by positions on close
+    entry: null,
     exit: priceUsd ?? null,
     pnlPct: null,
     reason: 'TP/SL or manual',
