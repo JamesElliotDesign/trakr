@@ -3,7 +3,7 @@ import pino from 'pino';
 import { cfg } from './config.js';
 import { getSpotPriceUsd } from './price.js';
 import { closePosition, getOpenPosition } from './positions.js';
-import { executeSell, resolveSellQtyAtoms } from './fastExecutor.js';
+import { executeSell, resolveSellQtyAtoms } from './executor.js';
 import { sendExitNotice } from './telegram.js';
 import { ensureSigner } from './keypair.js';
 
