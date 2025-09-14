@@ -25,37 +25,99 @@ function writeAll(state) {
 
 let state = readAll();
 
+function toBigIntOrNull(x) {
+  if (x == null) return null;
+  if (typeof x === 'bigint') return x;
+  if (typeof x === 'string' && x.length && /^[0-9]+$/.test(x)) return BigInt(x);
+  if (typeof x === 'number' && Number.isFinite(x)) return BigInt(Math.floor(x));
+  return null;
+}
+
 /**
  * Open a new position
- * shape: {
- *   mint, wallet, entryPriceUsd, qty, solSpent, tsOpen, sourceTx, mode
- * }
+ * shape (backward compatible):
+ *   {
+ *     mint, wallet,
+ *     entryPriceUsd,
+ *     qty,            // may be atoms or undefined (legacy)
+ *     qtyAtoms,       // preferred: bigint/string atoms
+ *     decimals,       // token decimals if known
+ *     solSpent,
+ *     tsOpen,
+ *     sourceTx,
+ *     mode
+ *   }
  */
-export function openPosition({ mint, wallet, entryPriceUsd, qty, solSpent, sourceTx, mode }) {
+export function openPosition({
+  mint,
+  wallet,
+  entryPriceUsd,
+  qty,
+  qtyAtoms,
+  decimals,
+  solSpent,
+  sourceTx,
+  mode
+}) {
+  // Normalize quantity: prefer explicit qtyAtoms, else treat qty as atoms if it looks like a count
+  const atoms =
+    toBigIntOrNull(qtyAtoms) ??
+    toBigIntOrNull(qty) ?? // legacy field — assumed atoms if provided
+    null;
+
+  // Normalize decimals if provided (keep null if unknown)
+  const tokenDecimals =
+    (typeof decimals === 'number' && Number.isFinite(decimals)) ? decimals : null;
+
+  // For convenience, compute a UI qty when possible; otherwise leave null
+  let qtyUi = null;
+  if (atoms != null && tokenDecimals != null) {
+    try {
+      qtyUi = Number(atoms) / (10 ** tokenDecimals);
+    } catch {
+      qtyUi = null;
+    }
+  }
+
   state.open[mint] = {
     mint,
-    wallet,
-    entryPriceUsd,
-    qty,
+    wallet: wallet ?? null,
+    entryPriceUsd: (typeof entryPriceUsd === 'number' && Number.isFinite(entryPriceUsd)) ? entryPriceUsd : null,
+    // Persist both, but prefer qtyAtoms for downstream logic
+    qtyAtoms: atoms,
+    decimals: tokenDecimals,
+    // Keep legacy field for compatibility; only set if we computed a UI number
+    qty: qtyUi,
     solSpent: solSpent ?? null,
     tsOpen: Date.now(),
     sourceTx: sourceTx || null,
     mode: mode || cfg.tradeMode
   };
+
   writeAll(state);
+
+  log.info(
+    {
+      mint,
+      entry: state.open[mint].entryPriceUsd,
+      qtyAtoms: state.open[mint].qtyAtoms ? String(state.open[mint].qtyAtoms) : null,
+      decimals: state.open[mint].decimals
+    },
+    'Opened position'
+  );
 }
 
 /** Close an existing position (move to closed array) */
 export function closePosition(mint, { exitPriceUsd, reason, exitTx = null }) {
   const pos = state.open[mint];
   if (!pos) return null;
-  const pnlPct = exitPriceUsd && pos.entryPriceUsd
+  const pnlPct = (typeof exitPriceUsd === 'number' && typeof pos.entryPriceUsd === 'number')
     ? ((exitPriceUsd - pos.entryPriceUsd) / pos.entryPriceUsd) * 100
     : null;
 
   const closed = {
     ...pos,
-    exitPriceUsd: exitPriceUsd ?? null,
+    exitPriceUsd: (typeof exitPriceUsd === 'number' && Number.isFinite(exitPriceUsd)) ? exitPriceUsd : null,
     pnlPct,
     tsClose: Date.now(),
     reason: reason || 'exit',

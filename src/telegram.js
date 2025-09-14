@@ -50,15 +50,48 @@ export async function sendTrackingSummary(walletsWithWin = []) {
   await sendMessage([header, ...lines].join('\n'));
 }
 
-/* --- New: entries & exits --- */
+/* --- Entries & exits --- */
 
-export async function sendEntryNotice({ mint, entryPriceUsd, qty, solSpent, mode, txid }) {
+function normalizeAtoms(x) {
+  if (x == null) return null;
+  if (typeof x === 'bigint') return x;
+  if (typeof x === 'string' && /^[0-9]+$/.test(x)) return BigInt(x);
+  if (typeof x === 'number' && Number.isFinite(x)) return BigInt(Math.floor(x));
+  return null;
+}
+
+function prettyNumber(n, maxFrac = 6) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  // trim unnecessary decimals while keeping precision for small caps
+  const s = n.toLocaleString(undefined, { maximumFractionDigits: maxFrac });
+  return s;
+}
+
+export async function sendEntryNotice({ mint, entryPriceUsd, qty, decimals, solSpent, mode, txid }) {
+  // Qty can be UI number, atoms as bigint/string/number, or undefined.
+  let qtyLine = '• Qty: pending';
+  const atoms = normalizeAtoms(qty);
+  if (atoms != null && typeof decimals === 'number' && Number.isFinite(decimals)) {
+    // atoms + decimals → UI tokens
+    const ui = Number(atoms) / (10 ** decimals);
+    const uiPretty = prettyNumber(ui, 6) ?? ui;
+    qtyLine = `• Qty: ${uiPretty}`;
+  } else if (typeof qty === 'number' && Number.isFinite(qty)) {
+    // treat as already-UI number
+    const uiPretty = prettyNumber(qty, 6) ?? qty;
+    qtyLine = `• Qty: ${uiPretty}`;
+  }
+
+  const entryPretty = (typeof entryPriceUsd === 'number' && Number.isFinite(entryPriceUsd))
+    ? prettyNumber(entryPriceUsd, 12)
+    : 'pending';
+
   const lines = [
     '🟢 *Position OPENED*',
     `• Token: \`${mint}\``,
-    `• Mode: ${mode}`,
-    `• Entry: $${entryPriceUsd}`,
-    `• Qty: ${qty}`,
+    `• Mode: ${mode ?? (cfg.tradeMode || 'live')}`,
+    `• Entry: $${entryPretty}`,
+    qtyLine,
     solSpent != null ? `• Spent: ${solSpent} SOL` : null,
     txid ? `• Tx: \`${txid}\`` : null,
     `• TP: +${cfg.takeProfitPercent}%`,
@@ -68,13 +101,16 @@ export async function sendEntryNotice({ mint, entryPriceUsd, qty, solSpent, mode
 }
 
 export async function sendExitNotice({ mint, entry, exit, pnlPct, reason, txid, mode }) {
+  const entryPretty = (typeof entry === 'number' && Number.isFinite(entry)) ? prettyNumber(entry, 12) : 'unknown';
+  const exitPretty  = (typeof exit === 'number'  && Number.isFinite(exit))  ? prettyNumber(exit, 12)  : 'unknown';
+
   const lines = [
     '🔴 *Position CLOSED*',
     `• Token: \`${mint}\``,
-    `• Mode: ${mode}`,
-    `• Entry: $${entry}`,
-    `• Exit: $${exit}`,
-    pnlPct != null ? `• PnL: ${pnlPct.toFixed(2)}%` : null,
+    `• Mode: ${mode ?? (cfg.tradeMode || 'live')}`,
+    `• Entry: $${entryPretty}`,
+    `• Exit: $${exitPretty}`,
+    pnlPct != null && Number.isFinite(pnlPct) ? `• PnL: ${Number(pnlPct).toFixed(2)}%` : null,
     `• Reason: ${reason}`,
     txid ? `• Tx: \`${txid}\`` : null
   ].filter(Boolean);
