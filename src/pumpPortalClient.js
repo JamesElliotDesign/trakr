@@ -158,3 +158,50 @@ export async function buyViaPumpTradeLocal({
     routeSummary: { strategy: 'pump-trade-local', endpointUsed: endpoint }
   };
 }
+
+/**
+ * Sell ALL tokens via Pump Portal (percentage-based).
+ * Avoids local BigInt math at exit time and prevents "Cannot convert undefined to a BigInt".
+ */
+export async function sellAllViaPumpTradeLocal({
+  outputMint,
+  slippageBps = DEFAULT_SLIPPAGE_BPS,
+  priorityFeeSol = DEFAULT_PRIORITY_FEE_SOL,
+  pool = DEFAULT_POOL
+}) {
+  const user = ensureSigner();
+  const slippagePercent = slippageBps / 100;
+
+  const body = {
+    publicKey: user.publicKey.toBase58(),
+    action: 'sell',
+    mint: outputMint,
+    amount: '100%',             // sell everything
+    denominatedInSol: 'false',  // amount is tokens/percentage, not SOL
+    slippage: slippagePercent,  // %
+    priorityFee: priorityFeeSol,
+    pool
+  };
+
+  const res = await fetch(TRADE_LOCAL_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`pump trade-local (sell) failed: ${res.status} ${t || res.statusText}`);
+  }
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  const tx = VersionedTransaction.deserialize(new Uint8Array(buf));
+  tx.sign([user]);
+
+  const { signature, endpointUsed } = await broadcastAndConfirmWithEndpoint(tx.serialize());
+
+  return {
+    signature,
+    routeSummary: { strategy: 'pump-trade-local', endpointUsed: endpointUsed || null }
+  };
+}

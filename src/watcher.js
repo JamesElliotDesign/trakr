@@ -15,6 +15,29 @@ function pctChange(entry, current) {
   return ((current - entry) / entry) * 100;
 }
 
+function normalizeAtoms(x) {
+  if (x == null) return null;
+  if (typeof x === 'bigint') return x;
+  if (typeof x === 'string' && /^[0-9]+$/.test(x)) {
+    try { return BigInt(x); } catch { return null; }
+  }
+  if (typeof x === 'number' && Number.isFinite(x)) {
+    try { return BigInt(Math.floor(x)); } catch { return null; }
+  }
+  return null;
+}
+
+function uiToAtoms(qtyUi, decimals) {
+  if (typeof qtyUi !== 'number' || !Number.isFinite(qtyUi)) return null;
+  if (typeof decimals !== 'number' || !Number.isFinite(decimals)) return null;
+  try {
+    const mul = 10 ** decimals;
+    return BigInt(Math.floor(qtyUi * mul));
+  } catch {
+    return null;
+  }
+}
+
 export function startWatcher(mint) {
   if (watchers.has(mint)) return;
 
@@ -35,17 +58,34 @@ export function startWatcher(mint) {
 
       exiting.add(mint);
 
+      // Build a robust sell request:
+      // 1) Prefer "sell all" semantics so we don't depend on local qty.
+      // 2) If we have a recorded quantity, include qtyAtoms too (executor may use it).
+      const sellReq = { mint, sellAll: true, percent: '100%' };
+
+      // If we know exact atoms, forward them (executor can choose what to use)
+      const atoms =
+        normalizeAtoms(pos.qtyAtoms) ??
+        uiToAtoms(pos.qty, pos.decimals);
+      if (atoms != null) {
+        // pass as string to avoid JSON bigint issues
+        sellReq.qtyAtoms = atoms.toString();
+      }
+
       // small internal retry loop for live sells
       let filled = null;
       let lastErr = null;
       for (let i = 0; i < 4; i++) {
         try {
-          filled = await executeSell({ mint, qty: pos.qty });
+          filled = await executeSell(sellReq);
           break;
         } catch (e) {
           lastErr = e;
           const ms = 600 + i * 500;
-          log.warn({ mint, try: i + 1, err: e?.message }, 'exit sell failed, retrying');
+          log.warn(
+            { mint, try: i + 1, err: e?.message, sellAll: sellReq.sellAll, hasQtyAtoms: !!sellReq.qtyAtoms },
+            'exit sell failed, retrying'
+          );
           await new Promise(r => setTimeout(r, ms));
         }
       }
@@ -58,9 +98,11 @@ export function startWatcher(mint) {
       }
 
       const closed = closePosition(mint, {
-        exitPriceUsd: filled.exitPriceUsd ?? p.priceUsd,
+        exitPriceUsd: (typeof filled.exitPriceUsd === 'number' && Number.isFinite(filled.exitPriceUsd))
+          ? filled.exitPriceUsd
+          : p.priceUsd,
         reason: hitTP ? `take_profit_${cfg.takeProfitPercent}%` : `stop_loss_${cfg.stopLossPercent}%`,
-        exitTx: filled.txid || null
+        exitTx: filled.txid || filled.signature || null
       });
 
       exiting.delete(mint);
