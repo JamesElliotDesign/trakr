@@ -63,16 +63,22 @@ export async function swapExactIn({ side, inputMint, outputMint, amount, slippag
     }));
   } catch (e) {
     // 2) Optional Pump Portal fallback for brand-new pump tokens (buy side only)
+    // Optional Pump Portal fallback for brand-new pump tokens (buy side only)
     if (process.env.PUMP_FALLBACK === 'true' && side === 'buy' && outputMint.endsWith('pump')) {
-  return await buyViaPumpTradeLocal({
-    outputMint,
-   amountLamports: amount,
-     slippageBps: slippageBps ?? (cfg.jupSlippageBps ?? 150),
-    // Use a separate env for Pump fee since their API wants SOL, not microLamports/CU
-     priorityFeeSol: Number(process.env.PUMP_PRIORITY_FEE_SOL || '0.00001'),
-     pool: process.env.PUMP_POOL?.trim() || 'auto'
-  });
- }
+    const res = await buyViaPumpTradeLocal({
+        outputMint,
+        amountLamports: amount,
+        slippageBps: slippageBps ?? (cfg.jupSlippageBps ?? 150),
+        priorityFeeSol: Number(process.env.PUMP_PRIORITY_FEE_SOL || '0.00001'),
+        pool: process.env.PUMP_POOL?.trim() || 'auto'
+    });
+    return {
+        signature: res.signature,
+        received: res.qtyAtoms ?? null,         // BigInt atoms (for P&L)
+        priceUsd: res.entryPriceUsd ?? null,    // Derived entry USD
+        routeSummary: res.routeSummary          // { strategy: 'pump-trade-local', endpointUsed }
+    };
+    }
     throw e;
   }
 
