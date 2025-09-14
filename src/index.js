@@ -6,8 +6,11 @@ import { getTopWallets } from './tracker.js';
 import { upsertHeliusWebhook, verifyHeliusRequest } from './helius.js';
 import { detectBuys } from './buyDetector.js';
 import { getSpotPriceUsd } from './price.js';
-import { sendSignal, sendTrackingSummary } from './telegram.js';
+import { sendSignal, sendTrackingSummary, sendEntryNotice } from './telegram.js';
 import { preloadSeen, flushSeenSync, seenCache } from './storage.js';
+import { hasOpenPosition, openPosition } from './positions.js';
+import { executeBuy } from './executor.js';
+import { startWatcher } from './watcher.js';
 
 const log = pino({ transport: { target: 'pino-pretty' }});
 
@@ -17,6 +20,7 @@ async function bootstrap() {
 
   const trackedSet = new Set();
   let latestSelection = [];
+  const buyingLocks = new Set(); // prevent double-buy racing on same mint
 
   app.get('/health', (_, res) => res.json({ ok: true }));
 
@@ -28,6 +32,7 @@ async function bootstrap() {
       for (const enhancedTx of events) {
         const buys = detectBuys(enhancedTx, trackedSet, seenCache);
         for (const b of buys) {
+          // 1) Send raw signal as before
           const p = await getSpotPriceUsd(b.mint, { amount: b.amount, solSpent: b.solSpent ?? undefined });
           await sendSignal({
             wallet: b.wallet,
@@ -37,7 +42,47 @@ async function bootstrap() {
             provider: p?.source ?? null,
             sourceTx: b.signature
           });
-          log.info({ ...b, price: p?.priceUsd ?? null }, 'Signal sent');
+
+          // 2) QUALIFY & FOLLOW: buy once per token
+          if (hasOpenPosition(b.mint)) {
+            log.debug({ mint: b.mint }, 'Position already open — skip buy');
+            continue;
+          }
+          if (buyingLocks.has(b.mint)) {
+            log.debug({ mint: b.mint }, 'Buy in-flight — skip duplicate');
+            continue;
+          }
+
+          buyingLocks.add(b.mint);
+          (async () => {
+            try {
+              const fill = await executeBuy({ mint: b.mint });
+              openPosition({
+                mint: b.mint,
+                wallet: b.wallet,            // originating signal wallet for reference
+                entryPriceUsd: fill.entryPriceUsd,
+                qty: fill.qty,
+                solSpent: fill.solSpent ?? null,
+                sourceTx: b.signature,
+                mode: fill.mode
+              });
+              await sendEntryNotice({
+                mint: b.mint,
+                entryPriceUsd: fill.entryPriceUsd,
+                qty: fill.qty,
+                solSpent: fill.solSpent ?? null,
+                mode: fill.mode,
+                txid: fill.txid || null
+              });
+
+              startWatcher(b.mint);
+              log.info({ mint: b.mint, entry: fill.entryPriceUsd, qty: fill.qty }, 'Opened position & started watcher');
+            } catch (e) {
+              log.warn({ mint: b.mint, err: e?.message }, 'executeBuy failed');
+            } finally {
+              buyingLocks.delete(b.mint);
+            }
+          })();
         }
       }
 
@@ -48,6 +93,7 @@ async function bootstrap() {
     }
   });
 
+  // Admin: manually refresh wallets (force) and push TG summary
   app.post('/admin/refresh-wallets', async (_req, res) => {
     await refreshTracked(true);
     res.json({ ok: true, tracked: latestSelection.map(x => x.address) });
@@ -55,7 +101,7 @@ async function bootstrap() {
 
   async function refreshTracked(sendTg = false) {
     try {
-      const selection = await getTopWallets();
+      const selection = await getTopWallets(); // [{address, winRatePercent, lastActiveMsAgo}]
       latestSelection = selection;
 
       trackedSet.clear();

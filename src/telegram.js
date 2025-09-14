@@ -1,3 +1,4 @@
+// src/telegram.js
 import fetch from 'node-fetch';
 import { cfg } from './config.js';
 
@@ -28,26 +29,54 @@ export async function sendSignal({ wallet, mint, amount, priceUsd, sourceTx, pro
     sourceTx ? `• Tx: \`${sourceTx}\`` : null,
     provider ? `• Price Source: ${provider}` : null
   ].filter(Boolean).join('\n');
-
   await sendMessage(text);
 }
 
 function fmtAgo(ms) {
-  if (ms === 0) return '0–24h'; // PnL 1d indicates activity in last day, no exact time
+  if (ms === 0) return '0–24h';
   const h = Math.floor(ms / 3600000);
   const m = Math.floor((ms % 3600000) / 60000);
   if (h >= 1) return `${h}h${m ? ` ${m}m` : ''}`;
   return `${m}m`;
 }
 
-export async function sendTrackingSummary(walletsWithWin) {
-  // walletsWithWin: [{ address, winRatePercent, lastActiveMsAgo }]
+export async function sendTrackingSummary(walletsWithWin = []) {
   const header = `🛰️ *Tracking ${walletsWithWin.length} wallets* (win% ≥ ${cfg.minWinRatePercent}, active ≤ ${cfg.activeWithinHours}h)`;
   const lines = walletsWithWin.map((w, i) => {
     const pct = (Number(w.winRatePercent) || 0).toFixed(2);
     const act = (w.lastActiveMsAgo == null) ? 'unknown' : fmtAgo(w.lastActiveMsAgo);
-    return `${String(i + 1).padStart(2, ' ')}. \`${w.address}\` — *${pct}%* _(active ${act} ago)_`;
+    return `${String(i + 1).padStart(2, ' ')}. \`${w.address}\` — *${pct}%* (active ${act} ago)`;
   });
-  const text = [header, ...lines].join('\n');
-  await sendMessage(text);
+  await sendMessage([header, ...lines].join('\n'));
+}
+
+/* --- New: entries & exits --- */
+
+export async function sendEntryNotice({ mint, entryPriceUsd, qty, solSpent, mode, txid }) {
+  const lines = [
+    '🟢 *Position OPENED*',
+    `• Token: \`${mint}\``,
+    `• Mode: ${mode}`,
+    `• Entry: $${entryPriceUsd}`,
+    `• Qty: ${qty}`,
+    solSpent != null ? `• Spent: ${solSpent} SOL` : null,
+    txid ? `• Tx: \`${txid}\`` : null,
+    `• TP: +${cfg.takeProfitPercent}%`,
+    `• SL: -${cfg.stopLossPercent}%`
+  ].filter(Boolean);
+  await sendMessage(lines.join('\n'));
+}
+
+export async function sendExitNotice({ mint, entry, exit, pnlPct, reason, txid, mode }) {
+  const lines = [
+    '🔴 *Position CLOSED*',
+    `• Token: \`${mint}\``,
+    `• Mode: ${mode}`,
+    `• Entry: $${entry}`,
+    `• Exit: $${exit}`,
+    pnlPct != null ? `• PnL: ${pnlPct.toFixed(2)}%` : null,
+    `• Reason: ${reason}`,
+    txid ? `• Tx: \`${txid}\`` : null
+  ].filter(Boolean);
+  await sendMessage(lines.join('\n'));
 }
