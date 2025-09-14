@@ -12,6 +12,8 @@
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
     "pino": "^9.3.2",
-    "pino-pretty": "^11.2.2"
+    "pino-pretty": "^11.2.2",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^5.0.0"
   }
 }

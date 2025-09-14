@@ -4,10 +4,14 @@ export const cfg = {
   // --- Server ---
   port: parseInt(process.env.PORT || '8080', 10),
 
-  // --- Helius ---
+  // --- Helius (RPC + Webhook) ---
   heliusApiKey: process.env.HELIUS_API_KEY,
   heliusWebhookId: process.env.HELIUS_WEBHOOK_ID || null,
   webhookPublicUrl: process.env.WEBHOOK_PUBLIC_URL, // e.g. https://<app>.up.railway.app/helius-webhook
+  rpcUrl: process.env.RPC_URL || (process.env.HELIUS_API_KEY ? `https://rpc.helius.xyz/?api-key=${process.env.HELIUS_API_KEY}` : 'https://api.mainnet-beta.solana.com'),
+
+  // --- Trader wallet (LIVE mode) ---
+  traderPrivateKey: process.env.TRADER_PRIVATE_KEY, // base58 string OR JSON array of numbers
 
   // --- Telegram ---
   tgToken: process.env.TELEGRAM_BOT_TOKEN,
@@ -16,7 +20,7 @@ export const cfg = {
   // --- SolanaTracker (candidates only) ---
   stApiKey: process.env.ST_API_KEY,
   stBaseUrl: 'https://data.solanatracker.io',
-  stWindow: process.env.ST_WINDOW || '1d',                  // '1d' or '3d'
+  stWindow: process.env.ST_WINDOW || '1d',
   topWallets: parseInt(process.env.TOP_WALLETS || '20', 10),
   trackTopN: parseInt(process.env.TRACK_TOP_N || '10', 10),
   minWinRatePercent: parseFloat(process.env.MIN_WIN_RATE_PERCENT || '35'),
@@ -32,9 +36,13 @@ export const cfg = {
   // --- Trading / positions ---
   tradeMode: (process.env.TRADE_MODE || 'paper').toLowerCase(), // 'paper' or 'live'
   buySolAmount: parseFloat(process.env.BUY_SOL_AMOUNT || '0.01'), // SOL per entry
-  takeProfitPercent: parseFloat(process.env.TP_PERCENT || '20'),  // e.g. 20 = +20%
-  stopLossPercent: parseFloat(process.env.SL_PERCENT || '10'),    // e.g. 10 = -10%
-  pricePollMs: parseInt(process.env.PRICE_POLL_MS || '2000', 10), // ms between price checks
+  takeProfitPercent: parseFloat(process.env.TP_PERCENT || '20'),
+  stopLossPercent: parseFloat(process.env.SL_PERCENT || '10'),
+  pricePollMs: parseInt(process.env.PRICE_POLL_MS || '2000', 10),
+
+  // Jupiter config for LIVE mode
+  jupSlippageBps: parseInt(process.env.JUP_SLIPPAGE_BPS || '150', 10), // 150 = 1.5%
+  jupPriorityFeeLamports: process.env.JUP_PRIORITY_FEE_LAMPORTS || 'auto', // 'auto' or integer string
 
   // --- Price provider preference ---
   priceProviderPref: process.env.PRICE_PROVIDER_PREF || 'jupiter',
