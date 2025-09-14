@@ -4,11 +4,11 @@ import { cfg } from './config.js';
 import { getSpotPriceUsd } from './price.js';
 import { ensureSigner } from './keypair.js';
 import { swapExactIn } from './jupiterClient.js';
-import { sendEntryNotice, sendExitNotice } from './telegram.js';
+import { PublicKey, Connection } from '@solana/web3.js';
+import { sendExitNotice } from './telegram.js';
 
 const log = pino({ transport: { target: 'pino-pretty' }});
 
-// Convenience
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const isLive = () => (cfg.tradeMode || 'paper').toLowerCase() === 'live';
 
@@ -16,17 +16,45 @@ function toLamports(sol) {
   return BigInt(Math.floor(Number(sol) * 1_000_000_000));
 }
 
+/** Resolve wallet token balance (atoms) for a mint. Retries briefly if not yet indexed. */
+async function resolveSellQtyAtoms({ rpcUrl, ownerPubkey, mint }) {
+  const conn = new Connection(rpcUrl, 'confirmed');
+  const owner = new PublicKey(ownerPubkey);
+  const mintPk = new PublicKey(mint);
+
+  async function getBestBalance() {
+    const resp = await conn.getParsedTokenAccountsByOwner(owner, { mint: mintPk }).catch(() => null);
+    const list = resp?.value || [];
+    if (!list.length) return 0n;
+    // Choose the largest parsed balance (some wallets have multiple accounts)
+    let best = 0n;
+    for (const it of list) {
+      const ui = it.account.data?.parsed?.info?.tokenAmount;
+      const amt = ui?.amount ? BigInt(ui.amount) : 0n;
+      if (amt > best) best = amt;
+    }
+    return best;
+  }
+
+  // Try a few times at confirmed, then finalized
+  const tiers = [
+    { attempts: 3, backoffMs: 150, commitment: 'confirmed' },
+    { attempts: 3, backoffMs: 250, commitment: 'finalized' }
+  ];
+  for (const t of tiers) {
+    for (let i = 0; i < t.attempts; i++) {
+      const qty = await getBestBalance();
+      if (qty > 0n) return qty;
+      await new Promise(r => setTimeout(r, t.backoffMs * (i + 1)));
+    }
+  }
+  return 0n;
+}
+
 /**
  * BUY: spend cfg.buySolAmount SOL to acquire `mint`.
  * Returns:
- *   {
- *     ok: true,
- *     txid: <string>,
- *     entryPriceUsd: <number|null>,
- *     qtyAtoms: <bigint|null>,
- *     decimals: <number|null>,
- *     strategy: <string|undefined> // 'pump-trade-local' when fallback used
- *   }
+ *   { ok, txid, entryPriceUsd, qtyAtoms, decimals, strategy }
  */
 export async function executeBuy({ mint }) {
   if (!isLive()) {
@@ -34,17 +62,9 @@ export async function executeBuy({ mint }) {
     return { ok: true, mode: 'paper', txid: null, entryPriceUsd: null, qtyAtoms: null, decimals: null };
   }
 
-  // Ensure signer exists early to fail fast if key misconfigured
   ensureSigner();
-
   const amountLamports = toLamports(cfg.buySolAmount);
 
-  // swapExactIn handles Jupiter first, then optional Pump fallback.
-  // It should return:
-  //  - signature: string
-  //  - received: bigint|null (token atoms received)
-  //  - priceUsd: number|null (entry usd if derived; esp. in pump fallback)
-  //  - routeSummary: { strategy?: string, ... }
   const { signature, priceUsd, received, routeSummary } = await swapExactIn({
     side: 'buy',
     inputMint: SOL_MINT,
@@ -53,8 +73,7 @@ export async function executeBuy({ mint }) {
     slippageBps: cfg.jupSlippageBps ?? 150
   });
 
-  // Prefer the precise entry price derived by the swap layer (for pump-trade-local),
-  // otherwise fall back to current price provider.
+  // Prefer precise entry price from swap (pump-trade-local derivation). Otherwise use spot.
   let entryPriceUsd = null;
   if (typeof priceUsd === 'number' && Number.isFinite(priceUsd)) {
     entryPriceUsd = priceUsd;
@@ -65,53 +84,68 @@ export async function executeBuy({ mint }) {
     }
   }
 
-  // Qty atoms (BigInt) if we received it — used by positions/P&L.
   const qtyAtoms = typeof received === 'bigint' ? received : null;
-
-  // Telegram notice (keep payload shape stable)
-  // NOTICE: positions module will send the OPENED notification.
-// (Avoid duplicate Telegram messages.)
-
 
   log.info(
     { mint, signature, route: routeSummary || {}, qtyAtoms: qtyAtoms ? String(qtyAtoms) : null, entryPriceUsd },
     'BUY filled'
   );
 
+  // NOTE: We no longer send the "OPENED" Telegram here to avoid duplicates.
+  // Your positions module should announce the open with the stored entry/qty.
+
   return {
     ok: true,
     txid: signature,
     entryPriceUsd,
     qtyAtoms,
-    decimals: null, // if you plumb decimals up from the swap layer, set it here
+    decimals: null,
     strategy: routeSummary?.strategy
   };
 }
 
 /**
  * SELL: sell `qty` (token atoms) of `mint` to SOL.
- * Caller passes raw token units (atoms), not decimals-adjusted.
- * Returns: { ok: true, txid: <string> }
+ * If `qty` is missing, we auto-resolve it from the wallet's on-chain balance.
+ * Returns: { ok: true, txid }
  */
 export async function executeSell({ mint, qty }) {
   if (!isLive()) {
-    log.info({ mint, qty: String(qty) }, '[paper] Skipping live sell (paper mode)');
+    log.info({ mint, qty: qty == null ? '(auto-resolve)' : String(qty) }, '[paper] Skipping live sell (paper mode)');
     return { ok: true, mode: 'paper', txid: null };
   }
 
-  ensureSigner();
+  const kp = ensureSigner();
+  let sellQty = qty;
+
+  if (sellQty == null) {
+    // Auto-resolve from chain to avoid BigInt(undefined) crashes
+    sellQty = await resolveSellQtyAtoms({
+      rpcUrl: process.env.RPC_URL || process.env.RPC_URLS?.split(',')[0]?.trim() || cfg.rpcUrl,
+      ownerPubkey: kp.publicKey.toBase58(),
+      mint
+    });
+
+    if (sellQty === 0n) {
+      log.warn({ mint }, 'No tokens found to sell');
+      throw new Error('no tokens available to sell (balance 0)');
+    }
+  }
+
+  // Ensure BigInt
+  const amountAtoms = typeof sellQty === 'bigint' ? sellQty : BigInt(sellQty);
 
   const { signature, priceUsd, routeSummary } = await swapExactIn({
     side: 'sell',
     inputMint: mint,
     outputMint: SOL_MINT,
-    amount: BigInt(qty),
+    amount: amountAtoms,
     slippageBps: cfg.jupSlippageBps ?? 150
   });
 
   await sendExitNotice({
     mint,
-    entry: null,           // your P&L module should fill this from stored position
+    entry: null, // your P&L module fills this from stored position
     exit: priceUsd ?? null,
     pnlPct: null,
     reason: 'TP/SL or manual',
