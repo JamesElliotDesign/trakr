@@ -5,7 +5,7 @@ import { cfg } from './config.js';
 import { ensureSigner } from './keypair.js';
 import { estimatePriorityFeeMicroLamports } from './priorityFees.js';
 import { broadcastAndConfirm } from './txSender.js';
-import { swapViaPumpPortalIfEnabled } from './pumpFallback.js'; // harmless if file not present
+import { buyViaPumpTradeLocal } from './pumpPortalClient.js';
 
 const JUP_QUOTE = 'https://quote-api.jup.ag/v6/quote';
 const JUP_SWAP  = 'https://quote-api.jup.ag/v6/swap';
@@ -64,8 +64,15 @@ export async function swapExactIn({ side, inputMint, outputMint, amount, slippag
   } catch (e) {
     // 2) Optional Pump Portal fallback for brand-new pump tokens (buy side only)
     if (process.env.PUMP_FALLBACK === 'true' && side === 'buy' && outputMint.endsWith('pump')) {
-      return await swapViaPumpPortalIfEnabled({ inputMint, outputMint, amountLamports: amount });
-    }
+  return await buyViaPumpTradeLocal({
+    outputMint,
+   amountLamports: amount,
+     slippageBps: slippageBps ?? (cfg.jupSlippageBps ?? 150),
+    // Use a separate env for Pump fee since their API wants SOL, not microLamports/CU
+     priorityFeeSol: Number(process.env.PUMP_PRIORITY_FEE_SOL || '0.00001'),
+     pool: process.env.PUMP_POOL?.trim() || 'auto'
+  });
+ }
     throw e;
   }
 
