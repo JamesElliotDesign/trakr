@@ -21,14 +21,23 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-/** ---- Simple global throttle for trade calls (helps avoid 429s) ---- */
+/** ---- Global trade pacing ---- */
 let lastTradeAt = 0;
 const MIN_TRADE_INTERVAL_MS = Number(process.env.MIN_TRADE_INTERVAL_MS || cfg.minTradeIntervalMs || 1500);
-async function throttleTrades() {
+
+// For buys: either fire immediately or skip
+const BUY_IMMEDIATE_ONLY = String(process.env.BUY_IMMEDIATE_ONLY ?? 'true').toLowerCase() === 'true';
+const BUY_MAX_STALENESS_MS = Number(process.env.BUY_MAX_STALENESS_MS || 0); // if >0 and not immediate-only, allow tiny waits
+
+function computeWaitMs() {
   const now = Date.now();
   const wait = lastTradeAt + MIN_TRADE_INTERVAL_MS - now;
+  return wait > 0 ? wait : 0;
+}
+
+async function throttleTrades() {
+  const wait = computeWaitMs();
   if (wait > 0) {
-    // small jitter to break sync bursts
     const jitter = Math.floor(Math.random() * 200);
     await sleep(wait + jitter);
   }
@@ -71,12 +80,22 @@ export async function resolveSellQtyAtoms({ rpcUrl, ownerPubkey, mint }) {
 /**
  * BUY: spend cfg.buySolAmount SOL to acquire `mint`.
  * Returns:
- *   { ok, txid, entryPriceUsd, qtyAtoms, decimals, strategy }
+ *   on success: { ok:true, txid, entryPriceUsd, qtyAtoms, decimals:null, strategy }
+ *   on skip:    { ok:false, skipped:true, reason:'throttled' }
  */
 export async function executeBuy({ mint }) {
   if (!isLive()) {
     log.info({ mint, sol: cfg.buySolAmount }, '[paper] Skipping live buy (paper mode)');
     return { ok: true, mode: 'paper', txid: null, entryPriceUsd: null, qtyAtoms: null, decimals: null };
+  }
+
+  // Immediate-only: if we have to wait, skip the buy
+  const pendingWait = computeWaitMs();
+  if (pendingWait > 0) {
+    if (BUY_IMMEDIATE_ONLY || pendingWait > BUY_MAX_STALENESS_MS) {
+      log.warn({ mint, pendingWait, minTradeIntervalMs: MIN_TRADE_INTERVAL_MS }, 'Buy skipped due to throttle staleness');
+      return { ok: false, skipped: true, reason: 'throttled' };
+    }
   }
 
   await throttleTrades();
@@ -122,7 +141,7 @@ export async function executeBuy({ mint }) {
 /**
  * SELL: sell tokens of `mint` to SOL.
  * If `qty` is missing, auto-resolve from wallet.
- * For pump tokens (or when PUMP_FALLBACK=true) try Pump Portal first with 100%,
+ * For pump tokens (or when PUMP_FALLBACK=true) try Pump Portal first (100%),
  * then fall back to Jupiter if needed.
  * Returns: { ok: true, txid }
  */
@@ -140,7 +159,6 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
   const kp = ensureSigner();
   const rpcUrl = process.env.RPC_URL || process.env.RPC_URLS?.split(',')[0]?.trim() || cfg.rpcUrl;
 
-  // Decide routing: use Pump Portal for pump mints or when PUMP_FALLBACK=true
   const isPumpMint = typeof mint === 'string' && mint.endsWith('pump');
   const pumpFallback = String(process.env.PUMP_FALLBACK || '').toLowerCase() === 'true';
   const shouldUsePump = isPumpMint || pumpFallback;
@@ -174,7 +192,6 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
       return { ok: true, txid: filled.signature };
     } catch (e) {
       const msg = String(e?.message || '');
-      // annotate rate limit so watcher can back off harder
       if (msg.includes('429')) {
         const err = new Error('RATE_LIMIT: ' + msg);
         err.code = 'RATE_LIMIT';
@@ -185,7 +202,6 @@ export async function executeSell({ mint, qty, sellAll = true, percent } = {}) {
     }
   }
 
-  // Jupiter fallback (may have no route on fresh pump tokens)
   let sellQty = qty;
   if (sellQty == null) {
     sellQty = await resolveSellQtyAtoms({

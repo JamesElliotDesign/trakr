@@ -12,11 +12,15 @@ const log = pino({ transport: { target: 'pino-pretty' }});
 const watchers = new Map(); // mint -> intervalId
 const exiting = new Set();  // mints currently attempting to exit
 
-// Per-mint cooldowns to avoid hammering when route/balance/rate-limit issues occur
-const sellCooldownUntil = new Map();     // mint -> timestamp ms
-const sellBackoffLevel = new Map();      // mint -> n (exponential)
+// Per-mint cooldowns & backoff
+const sellCooldownUntil = new Map(); // mint -> timestamp ms
+const sellBackoffLevel = new Map();  // mint -> n (exponential)
+
 const MAX_BACKOFF_MS = Number(process.env.WATCHER_MAX_BACKOFF_MS || 60_000);
 const BASE_BACKOFF_MS = Number(process.env.WATCHER_BASE_BACKOFF_MS || 1_500);
+
+// If buy never settles into wallet, auto-cancel after this window
+const BUY_SETTLE_TIMEOUT_MS = Number(process.env.BUY_SETTLE_TIMEOUT_MS || 45_000);
 
 function pctChange(entry, current) {
   return ((current - entry) / entry) * 100;
@@ -55,20 +59,44 @@ export function startWatcher(mint) {
       const change = pctChange(pos.entryPriceUsd, p.priceUsd);
       const hitTP = change >= cfg.takeProfitPercent;
       const hitSL = change <= -Math.abs(cfg.stopLossPercent);
-      if (!hitTP && !hitSL) return;
+      const shouldExit = hitTP || hitSL;
 
-      // Before trying to sell, ensure tokens actually exist in wallet.
-      // This prevents the "death loop" when buy hasn't settled.
+      // Check wallet balance first to avoid death loops.
       const owner = ensureSigner().publicKey.toBase58();
       const rpcUrl = process.env.RPC_URL || process.env.RPC_URLS?.split(',')[0]?.trim() || cfg.rpcUrl;
       const currentQty = await resolveSellQtyAtoms({ rpcUrl, ownerPubkey: owner, mint }).catch(() => 0n);
+
+      // If balance never arrives within timeout window, auto-cancel the position.
       if (currentQty === 0n) {
+        const ageMs = now() - (pos.tsOpen || 0);
+        if (ageMs >= BUY_SETTLE_TIMEOUT_MS) {
+          const closed = closePosition(mint, {
+            exitPriceUsd: p.priceUsd, // best info available
+            reason: 'buy_failed_no_balance',
+            exitTx: null
+          });
+          stopWatcher(mint);
+          resetBackoff(mint);
+          await sendExitNotice({
+            mint,
+            entry: pos.entryPriceUsd,
+            exit: closed.exitPriceUsd,
+            pnlPct: null,
+            reason: closed.reason,
+            txid: null,
+            mode: pos.mode
+          }).catch(() => {});
+          log.warn({ mint }, 'Auto-cancelled position: buy never settled into wallet');
+          return;
+        }
+        // Not yet timed out, keep waiting
         const ms = nextBackoffMs(mint);
         sellCooldownUntil.set(mint, now() + ms);
         log.warn({ mint }, 'No tokens found to sell (awaiting balance to settle); backing off');
         return;
       }
 
+      if (!shouldExit) return;
       if (exiting.has(mint)) return; // already trying to exit
       exiting.add(mint);
 
@@ -83,19 +111,16 @@ export function startWatcher(mint) {
           lastErr = e;
           const msg = String(e?.message || '');
           const code = e?.code || '';
-          // Rate limit or routing issues: set a longer external cooldown
-          if (msg.includes('429') || code === 'RATE_LIMIT' || msg.includes('no route') ) {
+          if (msg.includes('429') || code === 'RATE_LIMIT' || msg.includes('no route')) {
             const ms = nextBackoffMs(mint);
             sellCooldownUntil.set(mint, now() + ms);
           }
-          // No balance? set backoff too; recheck balance next tick
           if (msg.includes('balance 0') || code === 'NO_BALANCE') {
             const ms = nextBackoffMs(mint);
             sellCooldownUntil.set(mint, now() + ms);
             log.warn({ mint }, 'Sell aborted: wallet balance 0 during exit; will recheck later');
-            break; // don't keep spinning tries in this tick
+            break;
           }
-
           const ms = 600 + i * 500;
           log.warn({ mint, try: i + 1, err: msg, sellAll: true, hasQtyAtoms: true }, 'exit sell failed, retrying');
           await sleep(ms);
@@ -103,7 +128,6 @@ export function startWatcher(mint) {
       }
 
       if (!filled) {
-        // Could not sell now; keep position open and keep trying in later ticks
         exiting.delete(mint);
         const msg = lastErr?.message || 'unknown';
         const ms = nextBackoffMs(mint);
@@ -138,7 +162,6 @@ export function startWatcher(mint) {
     } catch (e) {
       exiting.delete(mint);
       const msg = e?.message || 'unknown';
-      // On generic failure, set a short cooldown to avoid tight loop
       const ms = nextBackoffMs(mint);
       sellCooldownUntil.set(mint, now() + ms);
       log.warn({ mint, err: msg }, 'watcher tick failed; backing off');
